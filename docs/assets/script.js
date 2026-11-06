@@ -2452,6 +2452,29 @@ window.openDeepSeekAI = function(type, groupIndex) {
 // ==========================================
 
 // 解析当前配置中的平台列表
+// 转义插入 innerHTML 的配置内容
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+// 从给定 YAML 文本取出列表，解析失败或不存在时返回空数组
+function parseListFromYaml(yamlText, pick) {
+    try {
+        const list = pick(jsyaml.load(yamlText) || {});
+        return Array.isArray(list) ? list : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+// 删除平台或 RSS 源后，同步移除独立展示区里对它的引用
+function removeFromStandalone(type, id) {
+    const list = parseStandaloneConfigFromYaml()[type];
+    if (list.includes(id)) {
+        updateStandaloneConfigInYaml(type, list.filter(item => item !== id));
+    }
+}
+
 function parsePlatformsFromYaml() {
     try {
         const doc = jsyaml.load(currentYaml);
@@ -2478,8 +2501,8 @@ function renderPlatformsList() {
         <div class="platform-item flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2 border border-gray-200 hover:border-blue-300 transition-colors" data-index="${idx}">
             <div class="flex items-center gap-2">
                 <i class="fa-solid fa-grip-vertical text-gray-300 cursor-move"></i>
-                <span class="text-xs font-medium text-gray-700">${p.name}</span>
-                <span class="text-[10px] text-gray-400">(${p.id})</span>
+                <span class="text-xs font-medium text-gray-700">${escapeHtml(p.name)}</span>
+                <span class="text-[10px] text-gray-400">(${escapeHtml(p.id)})</span>
             </div>
             <button onclick="removePlatform(${idx})" class="text-red-400 hover:text-red-600 text-xs" title="${t('common.delete')}">
                 <i class="fa-solid fa-trash"></i>
@@ -2507,8 +2530,10 @@ window.removePlatform = function(index) {
     const platformName = platforms[index].name;
     if (!confirm(t('confirm.deletePlatform', platformName))) return;
 
-    platforms.splice(index, 1);
+    const [removed] = platforms.splice(index, 1);
     updatePlatformsInYaml(platforms);
+    removeFromStandalone('platforms', removed.id);
+    renderStandaloneLists();
 }
 
 // 重新排序平台
@@ -2581,36 +2606,15 @@ function updatePlatformsInYaml(platforms) {
         sourcesEnd = lastDataLineIndex >= 0 ? lastDataLineIndex + 1 : lines.length;
     }
 
-    // 提取区域内的注释（保留在开头的注释）
+    // 只改动变化的条目：保留 expected_domain 等字段和注释
     const regionLines = lines.slice(sourcesStart, sourcesEnd);
-    const leadingComments = [];
-    for (const line of regionLines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith('#')) {
-            leadingComments.push(line);
-        } else if (trimmed.startsWith('-') || (trimmed && !trimmed.startsWith('#'))) {
-            // 遇到第一个数据项，停止收集注释
-            break;
-        } else if (trimmed === '') {
-            // 空行也保留
-            leadingComments.push(line);
-        }
-    }
+    const oldPlatforms = parseListFromYaml(yaml, doc => doc.platforms && doc.platforms.sources);
+    const newSourcesLines = YamlBlock.rewriteListItems(regionLines, oldPlatforms, platforms, { keyField: 'id', defaultIndent: '    ' });
 
-    const indent = '    '; // 4 空格缩进
-    const newSourcesLines = platforms.map(p =>
-        `${indent}- id: "${p.id}"\n${indent}  name: "${p.name}"`
-    ).join('\n');
-
-    const beforeSources = lines.slice(0, sourcesStart);
-    const afterSources = lines.slice(sourcesEnd);
-
-    // 组合：前面内容 + 开头注释 + 新数据 + 后面内容
     const newYaml = [
-        ...beforeSources,
-        ...(leadingComments.length > 0 ? leadingComments : []),
-        newSourcesLines,
-        ...afterSources
+        ...lines.slice(0, sourcesStart),
+        ...newSourcesLines,
+        ...lines.slice(sourcesEnd)
     ].join('\n');
 
     editor.value = newYaml;
@@ -2905,8 +2909,8 @@ function renderRssFeedsList() {
             <div class="flex items-center justify-between">
                 <div class="flex items-center gap-2 flex-1 min-w-0">
                     <i class="fa-solid fa-rss text-orange-400"></i>
-                    <span class="text-xs font-medium text-gray-700 truncate">${f.name}</span>
-                    <span class="text-[10px] text-gray-400">(${f.id})</span>
+                    <span class="text-xs font-medium text-gray-700 truncate">${escapeHtml(f.name)}</span>
+                    <span class="text-[10px] text-gray-400">(${escapeHtml(f.id)})</span>
                     ${f.enabled === false ? '<span class="text-[9px] bg-gray-200 text-gray-500 px-1 rounded">' + t('rssModal.disabled') + '</span>' : ''}
                 </div>
                 <div class="flex items-center gap-1">
@@ -2921,7 +2925,7 @@ function renderRssFeedsList() {
                     </button>
                 </div>
             </div>
-            <div class="text-[10px] text-gray-400 mt-1 truncate" title="${f.url}">${f.url}</div>
+            <div class="text-[10px] text-gray-400 mt-1 truncate" title="${escapeHtml(f.url)}">${escapeHtml(f.url)}</div>
         </div>
     `).join('');
 }
@@ -2934,8 +2938,10 @@ window.removeRssFeed = function(index) {
     const feedName = feeds[index].name;
     if (!confirm(t('confirm.deleteRss', feedName))) return;
 
-    feeds.splice(index, 1);
+    const [removed] = feeds.splice(index, 1);
     updateRssFeedsInYaml(feeds);
+    removeFromStandalone('rss_feeds', removed.id);
+    renderStandaloneLists();
 }
 
 // 切换 RSS 源启用状态
@@ -3017,45 +3023,15 @@ function updateRssFeedsInYaml(feeds) {
         feedsEnd = lastDataLineIndex >= 0 ? lastDataLineIndex + 1 : lines.length;
     }
 
-    // 提取区域内的注释（保留在开头的注释）
+    // 只改动变化的条目：保留未知字段、注释和分组标题
     const regionLines = lines.slice(feedsStart, feedsEnd);
-    const leadingComments = [];
-    for (const line of regionLines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith('#')) {
-            leadingComments.push(line);
-        } else if (trimmed.startsWith('-') || (trimmed && !trimmed.startsWith('#'))) {
-            // 遇到第一个数据项，停止收集注释
-            break;
-        } else if (trimmed === '') {
-            // 空行也保留
-            leadingComments.push(line);
-        }
-    }
+    const oldFeeds = parseListFromYaml(yaml, doc => doc.rss && doc.rss.feeds);
+    const newFeedsLines = YamlBlock.rewriteListItems(regionLines, oldFeeds, feeds, { keyField: 'id', defaultIndent: '    ', blankLineBetween: true });
 
-    // 构建新的 feeds 内容
-    const indent = '    '; // 4 空格缩进
-    const newFeedsLines = feeds.map(f => {
-        let feedYaml = `${indent}- id: "${f.id}"\n${indent}  name: "${f.name}"\n${indent}  url: "${f.url}"`;
-        if (f.enabled === false) {
-            feedYaml += `\n${indent}  enabled: false`;
-        }
-        if (f.max_age_days !== undefined && f.max_age_days !== '') {
-            feedYaml += `\n${indent}  max_age_days: ${f.max_age_days}`;
-        }
-        return feedYaml;
-    }).join('\n\n');
-
-    const beforeFeeds = lines.slice(0, feedsStart);
-    const afterFeeds = lines.slice(feedsEnd);
-
-    // 组合：前面内容 + 开头注释 + 新数据 + 空行 + 后面内容
     const newYaml = [
-        ...beforeFeeds,
-        ...(leadingComments.length > 0 ? leadingComments : []),
-        newFeedsLines,
-        '',
-        ...afterFeeds
+        ...lines.slice(0, feedsStart),
+        ...newFeedsLines,
+        ...lines.slice(feedsEnd)
     ].join('\n');
 
     editor.value = newYaml;
@@ -3120,9 +3096,12 @@ window.confirmAddRss = function() {
 
     const feeds = parseRssFeedsFromYaml();
 
-    const newFeed = { id, name, url };
+    const original = editIndex >= 0 ? feeds[editIndex] : null;
+    const newFeed = { ...(original || {}), id, name, url };
     if (maxAge) {
         newFeed.max_age_days = parseInt(maxAge);
+    } else {
+        delete newFeed.max_age_days;
     }
 
     if (editIndex >= 0) {
@@ -3132,6 +3111,13 @@ window.confirmAddRss = function() {
     }
 
     updateRssFeedsInYaml(feeds);
+    if (original && original.id !== id) {
+        const standaloneRss = parseStandaloneConfigFromYaml().rss_feeds;
+        if (standaloneRss.includes(original.id)) {
+            updateStandaloneConfigInYaml('rss_feeds', standaloneRss.map(item => item === original.id ? id : item));
+            renderStandaloneLists();
+        }
+    }
     closeRssModal();
 }
 
@@ -3170,11 +3156,11 @@ function renderStandaloneLists() {
             const isChecked = standaloneConfig.platforms.includes(p.id);
             return `
                 <label class="flex items-center gap-2 p-1.5 rounded hover:bg-white transition-colors cursor-pointer">
-                    <input type="checkbox" onchange="toggleStandaloneItem('platforms', '${p.id}')"
+                    <input type="checkbox" onchange="toggleStandaloneItem('platforms', ${escapeHtml(JSON.stringify(String(p.id)))})"
                            ${isChecked ? 'checked' : ''} class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                     <div class="min-w-0">
-                        <div class="text-xs font-medium text-gray-700 truncate">${p.name}</div>
-                        <div class="text-[9px] text-gray-400 truncate">${p.id}</div>
+                        <div class="text-xs font-medium text-gray-700 truncate">${escapeHtml(p.name)}</div>
+                        <div class="text-[9px] text-gray-400 truncate">${escapeHtml(p.id)}</div>
                     </div>
                 </label>
             `;
@@ -3189,14 +3175,14 @@ function renderStandaloneLists() {
             const isChecked = standaloneConfig.rss_feeds.includes(f.id);
             return `
                 <label class="flex items-center gap-2 p-1.5 rounded hover:bg-white transition-colors cursor-pointer">
-                    <input type="checkbox" onchange="toggleStandaloneItem('rss_feeds', '${f.id}')"
+                    <input type="checkbox" onchange="toggleStandaloneItem('rss_feeds', ${escapeHtml(JSON.stringify(String(f.id)))})"
                            ${isChecked ? 'checked' : ''} class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                     <div class="min-w-0 flex-1">
                         <div class="flex items-center justify-between">
-                            <span class="text-xs font-medium text-gray-700 truncate">${f.name}</span>
-                            <span class="text-[9px] text-gray-400 ml-2">${f.id}</span>
+                            <span class="text-xs font-medium text-gray-700 truncate">${escapeHtml(f.name)}</span>
+                            <span class="text-[9px] text-gray-400 ml-2">${escapeHtml(f.id)}</span>
                         </div>
-                        <div class="text-[9px] text-gray-400 truncate">${f.url}</div>
+                        <div class="text-[9px] text-gray-400 truncate">${escapeHtml(f.url)}</div>
                     </div>
                 </label>
             `;
@@ -3254,23 +3240,12 @@ function updateStandaloneConfigInYaml(type, list) {
     }
 
     if (targetLineIndex !== -1) {
-        // 构建新的数组字符串 ["item1", "item2"]
-        const jsonStr = JSON.stringify(list);
-        // 保留原有注释
-        const originalLine = lines[targetLineIndex];
-        const commentMatch = originalLine.match(/#.*$/);
-        const comment = commentMatch ? commentMatch[0] : '';
-
-        lines[targetLineIndex] = `${indent}${type}: ${jsonStr}${comment ? ' ' + comment : ''}`;
-
-        const newYaml = lines.join('\n');
+        // 兼容 `key: [...]` 和块状 `key:\n  - a` 两种写法，保留行尾注释
+        const newYaml = YamlBlock.replaceSequenceValue(lines, targetLineIndex, list).join('\n');
         editor.value = newYaml;
         currentYaml = newYaml;
         updateBackdrop('yaml-editor', 'yaml-backdrop');
         debounceSaveConfig();
-
-        // 不需要重新渲染整个列表，因为是 checkbox 点击触发的
-        // 但如果需要保持一致性，可以重新渲染
     }
 }
 
