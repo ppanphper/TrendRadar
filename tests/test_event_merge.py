@@ -82,6 +82,18 @@ class MergeTest(unittest.TestCase):
         self.assertFalse(result.ai_used)
         self.assertEqual(result.merged, 1)
 
+    def test_event_fields_survive_report_preparation(self):
+        from trendradar.report.generator import prepare_report_data
+
+        stats = _stats(("科技", [_t("阿里宣布平头哥赴港独立上市", "百度"), _t("阿里宣布平头哥赴港上市", "微博")]))
+        for t in stats[0]["titles"]:
+            t.update({"time_display": "", "count": 1, "rank_threshold": 5})
+        merged = merge_events(stats, None)
+        report = prepare_report_data(merged.stats, [], None, {}, mode="daily")
+        title = report["stats"][0]["titles"][0]
+        self.assertEqual(title["event_sources"], ["百度", "微博"])
+        self.assertEqual(title["event_headline"], "阿里宣布平头哥赴港独立上市")
+
     def test_parse_ai_events_ignores_invalid_ids(self):
         events, seen = parse_ai_events('结果：{"events": [{"ids": [1, 99, 2], "headline": "x"}, {"ids": [3]}], "seen": [2, "a", 0]}', 3)
         self.assertEqual(events, [([1, 2], "x")])

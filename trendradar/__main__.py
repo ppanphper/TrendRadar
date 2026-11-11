@@ -869,6 +869,9 @@ class NewsAnalyzer:
                 f"[事件归并] {'AI + 字面' if merged.ai_used else '字面'}：合并 {merged.merged} 条，"
                 f"移除已推送事件 {merged.seen_dropped} 条，剩 {len(merged.headlines)} 个事件"
             )
+            if cfg.get("DEBUG"):
+                for headline, members in merged.clusters:
+                    print(f"[事件归并][DEBUG] {headline} ← {' ; '.join(members)}")
 
         # 检查是否有有效内容（热榜或RSS）
         has_news_content = self._has_valid_content(stats, new_titles)

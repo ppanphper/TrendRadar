@@ -118,6 +118,10 @@ def prepare_report_data(
                 "rank_timeline": title_data.get("rank_timeline", []),
                 "relevance_score": title_data.get("relevance_score"),
             }
+            # 事件归并的结果（见 notification/events.py）
+            for key in ("event_headline", "event_sources", "event_size"):
+                if key in title_data:
+                    processed_title[key] = title_data[key]
             processed_titles.append(processed_title)
 
         processed_stats.append(

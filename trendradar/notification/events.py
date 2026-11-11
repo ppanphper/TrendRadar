@@ -92,6 +92,8 @@ class MergeResult:
     merged: int = 0                                      # 被并入其他条目的数量
     seen_dropped: int = 0                                # 与已推送事件相同而移除的数量
     ai_used: bool = False
+    clusters: List[Tuple[str, List[str]]] = field(default_factory=list)  # 多条合并的事件：(标题, ["来源｜原标题", ...])
+    seen: List[str] = field(default_factory=list)                        # 因与已推送事件相同而移除的原标题
 
 
 def parse_ai_events(text: str, count: int) -> Tuple[List[Tuple[List[int], str]], Set[int]]:
@@ -216,6 +218,7 @@ def merge_events(
                 if root in seen_roots:
                     removed.update(members)
                     result.seen_dropped += len(members)
+                    result.seen.extend(candidates[m].title for m in members)
             alive = [i for i in alive if i not in removed]
             result.ai_used = True
             # 合并后根节点可能变化，按最终根重新映射标题
@@ -240,6 +243,10 @@ def merge_events(
             keep.data["event_size"] = len(members)
             drop.update(members[1:])
             result.merged += len(members) - 1
+            result.clusters.append((
+                keep.data["event_headline"],
+                [f"{candidates[m].data.get('source_name', '')}｜{candidates[m].title}" for m in members],
+            ))
         result.headlines.append(keep.data.get("event_headline") or keep.title)
 
     def rebuild(kind: str, groups: Optional[List[Dict]]) -> Optional[List[Dict]]:
