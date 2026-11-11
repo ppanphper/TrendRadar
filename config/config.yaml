@@ -147,6 +147,8 @@ rss:
     #   url: "https://example.com/feed.xml"
     #   enabled: false
     #   max_age_days: 0               # 示例：禁用过滤，推送所有文章
+    #   use_proxy: true               # 可选：单独让这个源走代理（覆盖 advanced.rss.use_proxy）
+    #   impersonate: "chrome"         # 可选：模拟浏览器 TLS 指纹，用于 Cloudflare 拦截 Python 客户端的站点（如 linux.do）
 
 
 # ===============================================================

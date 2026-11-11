@@ -1006,34 +1006,13 @@ class NewsAnalyzer:
             return None, None, None, set()
 
         try:
-            from trendradar.crawler.rss import RSSFetcher, RSSFeedConfig
+            from trendradar.crawler.rss import RSSFetcher
+            from trendradar.crawler.rss.fetcher import feed_config_from_dict
 
             # 构建 RSS 源配置
             feeds = []
             for feed_config in rss_feeds:
-                # 读取并验证单个 feed 的 max_age_days（可选）
-                max_age_days_raw = feed_config.get("max_age_days")
-                max_age_days = None
-                if max_age_days_raw is not None:
-                    try:
-                        max_age_days = int(max_age_days_raw)
-                        if max_age_days < 0:
-                            feed_id = feed_config.get("id", "unknown")
-                            print(f"[警告] RSS feed '{feed_id}' 的 max_age_days 为负数，将使用全局默认值")
-                            max_age_days = None
-                    except (ValueError, TypeError):
-                        feed_id = feed_config.get("id", "unknown")
-                        print(f"[警告] RSS feed '{feed_id}' 的 max_age_days 格式错误：{max_age_days_raw}")
-                        max_age_days = None
-
-                feed = RSSFeedConfig(
-                    id=feed_config.get("id", ""),
-                    name=feed_config.get("name", ""),
-                    url=feed_config.get("url", ""),
-                    max_items=feed_config.get("max_items", 50),
-                    enabled=feed_config.get("enabled", True),
-                    max_age_days=max_age_days,  # None=使用全局，0=禁用，>0=覆盖
-                )
+                feed = feed_config_from_dict(feed_config, default_max_items=50)
                 if feed.id and feed.url and feed.enabled:
                     feeds.append(feed)
 
