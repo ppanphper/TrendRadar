@@ -72,6 +72,34 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(result.seen_dropped, 1)
         self.assertIn("中方向美方移交援华飞行员遗骸", result.headlines)
 
+    def test_ai_group_without_shared_entity_is_split(self):
+        stats = _stats(("科技", [
+            _t("谷歌发布 Gemini 4 Carbon 模型", "知乎"),
+            _t("Gemini 4 Carbon 上线，跑分刷新纪录", "微博"),
+            _t("纳斯达克将推行 23 小时连续交易", "财联社"),
+        ]))
+
+        def chat(messages):
+            return json.dumps({"events": [{"ids": [1, 2, 3], "headline": "谷歌发布 Gemini 4 Carbon"}], "seen": []})
+
+        result = merge_events(stats, None, ai_chat=chat, prompt=PROMPT)
+        self.assertEqual(result.ai_rejected, 1)
+        titles = sorted(t.get("event_headline") or t["title"] for t in result.stats[0]["titles"])
+        self.assertEqual(titles, ["纳斯达克将推行 23 小时连续交易", "谷歌发布 Gemini 4 Carbon"])
+
+    def test_ai_guard_keeps_paraphrases_of_different_length(self):
+        stats = _stats(("消费", [
+            _t("拼多多送货上门新规11月13日生效", "百度"),
+            _t("拼多多新规「商家若违背上门承诺，未履约每单赔付十元」：规则出台的考量是什么？落地执行的主要难点有哪些？", "知乎"),
+        ]))
+
+        def chat(messages):
+            return json.dumps({"events": [{"ids": [1, 2], "headline": "拼多多送货上门新规生效，违约每单赔付10元"}], "seen": []})
+
+        result = merge_events(stats, None, ai_chat=chat, prompt=PROMPT)
+        self.assertEqual(result.ai_rejected, 0)
+        self.assertEqual(result.merged, 1)
+
     def test_ai_failure_falls_back_to_lexical(self):
         stats = _stats(("科技", [_t("阿里宣布平头哥赴港独立上市", "百度"), _t("阿里宣布平头哥赴港上市", "微博")]))
 

@@ -15,6 +15,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 _NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
 
 LEXICAL_JACCARD = 0.5
+# AI 归并的校验：组内每条与另一条的二元组重叠系数（交集 / 较短标题的二元组数）至少为该值，否则拆出。
+# 2026-11-11 回放：没有共同实体的误合并为 0.00，正确的跨平台改写为 0.12~0.81
+AI_MIN_OVERLAP = 0.1
 CONTAIN_MIN_CHARS = 6
 MAX_AI_ITEMS = 300
 
@@ -43,6 +46,16 @@ def _similar_sig(a: Tuple[str, Set[str]], b: Tuple[str, Set[str]]) -> bool:
     if len(short) >= CONTAIN_MIN_CHARS and short in long_:
         return True
     return len(ga & gb) / len(ga | gb) >= LEXICAL_JACCARD
+
+
+def _overlap(a: Tuple[str, Set[str]], b: Tuple[str, Set[str]]) -> float:
+    """重叠系数：长短标题差异大时不像 Jaccard 那样被稀释"""
+    ga, gb = a[1], b[1]
+    return len(ga & gb) / min(len(ga), len(gb)) if ga and gb else 0.0
+
+
+def _english_tokens(title: str) -> Set[str]:
+    return {t for t in re.findall(r"[a-z][a-z0-9]+", unicodedata.normalize("NFKC", title or "").lower()) if len(t) > 2}
 
 
 def lexically_similar(a: str, b: str) -> bool:
@@ -92,6 +105,8 @@ class MergeResult:
     merged: int = 0                                      # 被并入其他条目的数量
     seen_dropped: int = 0                                # 与已推送事件相同而移除的数量
     ai_used: bool = False
+    ai_rejected: int = 0                                 # AI 分组中未通过字面校验而拆出的条目数
+    rejected: List[Tuple[str, str]] = field(default_factory=list)  # (AI 标题, 被拆出的原标题)，用于调试
     clusters: List[Tuple[str, List[str]]] = field(default_factory=list)  # 多条合并的事件：(标题, ["来源｜原标题", ...])
     seen: List[str] = field(default_factory=list)                        # 因与已推送事件相同而移除的原标题
 
@@ -209,10 +224,23 @@ def merge_events(
             events, seen = parse_ai_events(ai_chat(messages), len(reps))
             for ids, headline in events:
                 members = [reps[i - 1] for i in ids]
-                for m in members[1:]:
-                    uf.union(members[0], m)
+                # 校验：每条至少与组内另一条有字面重合或共同英文词，否则拆出
+                checked = [
+                    m for m in members
+                    if any(
+                        _overlap(sigs[m], sigs[o]) >= AI_MIN_OVERLAP
+                        or _english_tokens(candidates[m].title) & _english_tokens(candidates[o].title)
+                        for o in members if o != m
+                    )
+                ]
+                result.ai_rejected += len(members) - len(checked)
+                result.rejected.extend((headline, candidates[m].title) for m in members if m not in checked)
+                if len(checked) < 2:
+                    continue
+                for m in checked[1:]:
+                    uf.union(checked[0], m)
                 if headline:
-                    headlines[uf.find(members[0])] = headline
+                    headlines[uf.find(checked[0])] = headline
             seen_roots = {uf.find(reps[i - 1]) for i in seen}
             for root, members in clusters().items():
                 if root in seen_roots:
