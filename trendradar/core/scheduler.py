@@ -30,6 +30,8 @@ class ResolvedSchedule:
     frequency_file: Optional[str] = None  # 频率词文件路径，None=使用默认
     filter_method: Optional[str] = None   # 筛选策略: "keyword"|"ai"，None=使用全局配置
     interests_file: Optional[str] = None  # AI 筛选兴趣文件，None=使用默认
+    push_min_score: Optional[float] = None  # 只推送 AI 相关度不低于该值的条目（即时提醒），None=不限制
+    silent: bool = False                  # 静音推送（Telegram disable_notification）
 
 
 class Scheduler:
@@ -171,6 +173,8 @@ class Scheduler:
             frequency_file=merged.get("frequency_file"),
             filter_method=merged.get("filter_method"),
             interests_file=merged.get("interests_file"),
+            push_min_score=self._resolve_min_score(merged.get("push_min_score")),
+            silent=bool(merged.get("silent", False)),
         )
 
         # 打印行为摘要
@@ -180,7 +184,12 @@ class Scheduler:
         if resolved.analyze:
             actions.append(f"分析(AI:{resolved.ai_mode})")
         if resolved.push:
-            actions.append(f"推送(模式:{resolved.report_mode})")
+            extras = []
+            if resolved.push_min_score is not None:
+                extras.append(f"相关度≥{resolved.push_min_score}")
+            if resolved.silent:
+                extras.append("静音")
+            actions.append(f"推送(模式:{resolved.report_mode}{', ' + ', '.join(extras) if extras else ''})")
         print(f"[调度] 行为: {', '.join(actions) if actions else '无'}")
         if resolved.frequency_file:
             print(f"[调度] 频率词文件: {resolved.frequency_file}")
@@ -272,6 +281,17 @@ class Scheduler:
             base["once"] = merged_once
 
         return base
+
+    @staticmethod
+    def _resolve_min_score(value: Any) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            print(f"[调度] push_min_score 格式错误：{value}，已忽略")
+            return None
+        return score if score > 0 else None
 
     @staticmethod
     def _resolve_ai_mode(cfg: Dict[str, Any]) -> str:

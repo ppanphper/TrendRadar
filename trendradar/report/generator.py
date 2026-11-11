@@ -116,6 +116,7 @@ def prepare_report_data(
                 "mobile_url": title_data.get("mobileUrl", ""),
                 "is_new": title_data.get("is_new", False),
                 "rank_timeline": title_data.get("rank_timeline", []),
+                "relevance_score": title_data.get("relevance_score"),
             }
             processed_titles.append(processed_title)
 

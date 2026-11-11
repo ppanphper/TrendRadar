@@ -265,6 +265,12 @@ notification:
   enabled: true                       # 是否启用通知功能（true=启用, false=关闭）—— 总开关
                                       # 开启 schedule 后此项仍为总开关：false=永远不推送，true=由调度控制
 
+  # 跨次去重：推送过的新闻不再推送（跨推送、跨天），仅本地存储可用
+  # 开启后 daily 模式即为「上次推送以来未推过的内容」，适合定时摘要
+  dedupe:
+    enabled: false                    # 是否启用（true=启用, false=关闭）
+    retention_days: 7                 # 已推送记录保留天数
+
   # 推送渠道配置
   channels:
     feishu:
@@ -280,6 +286,8 @@ notification:
     telegram:
       bot_token: ""                   # Telegram Bot Token
       chat_id: ""                     # Telegram Chat ID
+      message_thread_id: ""           # 群组话题 ID（可选，发到指定话题）
+      style: "classic"                # 版式：classic=原版式，digest=摘要版式（精选 + 分组折叠，消息更少）
 
     email:
       from: ""                        # 发件人邮箱地址
