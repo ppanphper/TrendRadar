@@ -568,6 +568,7 @@ class AIFilterPipeline:
                     "is_new": is_new,
                     "time_display": time_display,
                     "matched_keyword": tag_name,
+                    "relevance_score": item.get("relevance_score"),
                 }
 
                 if source_type == "rss":

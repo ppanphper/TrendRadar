@@ -488,6 +488,12 @@ def send_to_telegram(
     ai_analysis: Any = None,
     display_regions: Optional[Dict] = None,
     standalone_data: Optional[Dict] = None,
+    message_thread_id: str = "",
+    style: str = "classic",
+    silent: bool = False,
+    headline: Optional[str] = None,
+    alert: bool = False,
+    get_time_func: Optional[Callable] = None,
 ) -> bool:
     """
     发送到 Telegram（支持分批发送，支持热榜+RSS合并+独立展示区）
@@ -506,6 +512,11 @@ def send_to_telegram(
         split_content_func: 内容分批函数
         rss_items: RSS 统计条目列表（可选，用于合并推送）
         rss_new_items: RSS 新增条目列表（可选，用于新增区块）
+        message_thread_id: 群组话题 ID（可选）
+        style: classic=原版式，digest=摘要版式（见 docs/design.md）
+        silent: 静音推送（disable_notification）
+        headline: 摘要版式的标题（如调度时段名）
+        alert: 摘要版式下按即时提醒排版
 
     Returns:
         bool: 发送是否成功
@@ -524,20 +535,34 @@ def send_to_telegram(
     ai_content = _render_ai_analysis(ai_analysis, "telegram") if ai_analysis else None
     ai_stats = _extract_ai_stats(ai_analysis)
 
-    # 获取分批内容，预留批次头部空间
-    header_reserve = get_max_batch_header_size("telegram")
-    batches = split_content_func(
-        report_data, "telegram", update_info, max_bytes=batch_size - header_reserve, mode=mode,
-        rss_items=rss_items,
-        rss_new_items=rss_new_items,
-        ai_content=ai_content,
-        standalone_data=standalone_data,
-        ai_stats=ai_stats,
-        report_type=report_type,
-    )
+    if style == "digest":
+        from trendradar.notification.telegram_digest import build_telegram_digest
 
-    # 统一添加批次头部（已预留空间，不会超限）
-    batches = add_batch_headers(batches, "telegram", batch_size)
+        batches = build_telegram_digest(
+            report_data, rss_items, standalone_data, ai_content,
+            mode=mode,
+            now=get_time_func() if get_time_func else None,
+            headline=headline,
+            alert=alert,
+        )
+        if not batches:
+            print(f"{log_prefix}没有可推送的内容，跳过 [{report_type}]")
+            return False
+    else:
+        # 获取分批内容，预留批次头部空间
+        header_reserve = get_max_batch_header_size("telegram")
+        batches = split_content_func(
+            report_data, "telegram", update_info, max_bytes=batch_size - header_reserve, mode=mode,
+            rss_items=rss_items,
+            rss_new_items=rss_new_items,
+            ai_content=ai_content,
+            standalone_data=standalone_data,
+            ai_stats=ai_stats,
+            report_type=report_type,
+        )
+
+        # 统一添加批次头部（已预留空间，不会超限）
+        batches = add_batch_headers(batches, "telegram", batch_size)
 
     print(f"{log_prefix}消息分为 {len(batches)} 批次发送 [{report_type}]")
 
@@ -554,11 +579,25 @@ def send_to_telegram(
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if message_thread_id:
+            payload["message_thread_id"] = int(message_thread_id) if str(message_thread_id).isdigit() else message_thread_id
+        if silent:
+            payload["disable_notification"] = True
 
         try:
             response = requests.post(
                 url, headers=headers, json=payload, proxies=proxies, timeout=30
             )
+            if response.status_code == 400 and "can't parse entities" in response.text:
+                # HTML 实体解析失败时改发纯文本，避免整轮推送中断
+                from trendradar.notification.telegram_digest import to_plain_text
+
+                print(f"{log_prefix}第 {i}/{len(batches)} 批次 HTML 解析失败，改发纯文本：{response.text[:200]}")
+                payload["text"] = to_plain_text(batch_content)
+                payload.pop("parse_mode", None)
+                response = requests.post(
+                    url, headers=headers, json=payload, proxies=proxies, timeout=30
+                )
             if response.status_code == 200:
                 result = response.json()
                 if result.get("ok"):
@@ -573,7 +612,7 @@ def send_to_telegram(
                     return False
             else:
                 print(
-                    f"{log_prefix}第 {i}/{len(batches)} 批次发送失败 [{report_type}]，状态码：{response.status_code}"
+                    f"{log_prefix}第 {i}/{len(batches)} 批次发送失败 [{report_type}]，状态码：{response.status_code}，响应：{response.text[:200]}"
                 )
                 return False
         except Exception as e:

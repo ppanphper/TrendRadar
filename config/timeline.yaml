@@ -172,6 +172,8 @@ presets:
       # frequency_file: "xxx.txt"               # 关键词文件（可选，位于 config/custom/keyword/）
       # interests_file: "xxx.txt"                # AI 兴趣文件（可选，位于 config/custom/ai/）
       # filter_method: "keyword"                # 筛选策略（可选: keyword | ai，不填用全局 filter.method）
+      # push_min_score: 0.9                     # 只推送 AI 相关度不低于该值的条目（可选，用于即时提醒，需 filter.method=ai）
+      # silent: true                            # 静音推送（可选，目前仅 Telegram 支持）
       once:
         analyze: false             # 不限制分析次数
         push: false                # 不限制推送次数

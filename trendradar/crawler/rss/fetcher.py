@@ -8,13 +8,37 @@ RSS 抓取器
 import time
 import random
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import requests
 
+from .archive import archive_items
 from .parser import RSSParser
 from trendradar.storage.base import RSSItem, RSSData
 from trendradar.utils.time import get_configured_time, is_within_days, DEFAULT_TIMEZONE
+
+
+ACCEPT_HEADERS = {
+    "Accept": "application/feed+json, application/json, application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+
+class _CurlResponse:
+    """把 curl_cffi 响应适配为 fetch_feed 用到的 requests 接口"""
+
+    def __init__(self, response):
+        self._response = response
+        self.status_code = response.status_code
+        self.headers = response.headers
+        self.text = response.text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            error = requests.HTTPError(f"{self.status_code} Error for url: {self._response.url}")
+            error.response = self
+            raise error
 
 
 @dataclass
@@ -26,6 +50,47 @@ class RSSFeedConfig:
     max_items: int = 0          # 最大条目数（0=不限制）
     enabled: bool = True        # 是否启用
     max_age_days: Optional[int] = None  # 文章最大年龄（天），覆盖全局设置；None=使用全局，0=禁用过滤
+    use_proxy: Optional[bool] = None    # 是否走代理，覆盖全局 advanced.rss.use_proxy；None=使用全局
+    impersonate: str = ""               # 模拟浏览器 TLS 指纹（如 "chrome"），用于 Cloudflare 拦截 Python 客户端的站点；需要 curl_cffi
+    archive: bool = False               # 是否把条目全文存为本地快照（<data_dir>/archive）
+
+
+def feed_config_from_dict(feed_config: Dict, default_max_items: int = 0) -> RSSFeedConfig:
+    """从 config.yaml 的单个 feed 字典构建 RSSFeedConfig（校验 max_age_days、use_proxy）"""
+    feed_id = feed_config.get("id", "unknown")
+
+    max_age_days_raw = feed_config.get("max_age_days")
+    max_age_days = None
+    if max_age_days_raw is not None:
+        try:
+            max_age_days = int(max_age_days_raw)
+            if max_age_days < 0:
+                print(f"[警告] RSS feed '{feed_id}' 的 max_age_days 为负数，将使用全局默认值")
+                max_age_days = None
+        except (ValueError, TypeError):
+            print(f"[警告] RSS feed '{feed_id}' 的 max_age_days 格式错误：{max_age_days_raw}")
+            max_age_days = None
+
+    use_proxy_raw = feed_config.get("use_proxy")
+    use_proxy = use_proxy_raw if isinstance(use_proxy_raw, bool) else None
+    if use_proxy_raw is not None and use_proxy is None:
+        print(f"[警告] RSS feed '{feed_id}' 的 use_proxy 应为 true/false：{use_proxy_raw}，将使用全局设置")
+
+    return RSSFeedConfig(
+        id=feed_config.get("id", ""),
+        name=feed_config.get("name", ""),
+        url=feed_config.get("url", ""),
+        max_items=feed_config.get("max_items", default_max_items),
+        enabled=feed_config.get("enabled", True),
+        max_age_days=max_age_days,  # None=使用全局，0=禁用，>0=覆盖
+        use_proxy=use_proxy,
+        impersonate=str(feed_config.get("impersonate") or "").strip(),
+        archive=feed_config.get("archive") is True,
+    )
+
+
+class _HostRateLimited(Exception):
+    """同一站点本轮已返回 429，跳过该站点剩余的源"""
 
 
 class RSSFetcher:
@@ -41,6 +106,7 @@ class RSSFetcher:
         timezone: str = DEFAULT_TIMEZONE,
         freshness_enabled: bool = True,
         default_max_age_days: int = 3,
+        archive_dir: Optional[str] = None,
     ):
         """
         初始化抓取器
@@ -54,6 +120,7 @@ class RSSFetcher:
             timezone: 时区配置（如 'Asia/Shanghai'）
             freshness_enabled: 是否启用新鲜度过滤
             default_max_age_days: 默认最大文章年龄（天）
+            archive_dir: 快照目录（源配置 archive: true 时写入）
         """
         self.feeds = [f for f in feeds if f.enabled]
         self.request_interval = request_interval
@@ -63,17 +130,19 @@ class RSSFetcher:
         self.timezone = timezone
         self.freshness_enabled = freshness_enabled
         self.default_max_age_days = default_max_age_days
+        self.archive_dir = archive_dir
 
         self.parser = RSSParser()
         self.session = self._create_session()
+        self._impersonate_session = None
+        self._rate_limited_hosts: Set[str] = set()
 
     def _create_session(self) -> requests.Session:
         """创建请求会话"""
         session = requests.Session()
         session.headers.update({
             "User-Agent": "TrendRadar/2.0 RSS Reader (https://github.com/trendradar)",
-            "Accept": "application/feed+json, application/json, application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            **ACCEPT_HEADERS,
         })
 
         if self.use_proxy and self.proxy_url:
@@ -83,6 +152,70 @@ class RSSFetcher:
             }
 
         return session
+
+    def _feed_proxies(self, feed: RSSFeedConfig) -> Optional[Dict[str, str]]:
+        """单个源的代理设置；None 表示沿用会话默认值"""
+        if feed.use_proxy is None:
+            return None
+        if feed.use_proxy:
+            return {"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None
+        # 显式关闭：值为 None 的键会从会话代理中移除
+        return {"http": None, "https": None}
+
+    def _get_impersonate_session(self):
+        """延迟创建 curl_cffi 会话，未安装时给出明确错误"""
+        if self._impersonate_session is None:
+            try:
+                from curl_cffi import requests as curl_requests
+            except ImportError as e:
+                raise RuntimeError("impersonate 需要安装 curl_cffi") from e
+            self._impersonate_session = curl_requests.Session()
+        return self._impersonate_session
+
+    def _fetch_bytes(self, feed: RSSFeedConfig, url: str) -> Optional[bytes]:
+        """下载快照里的图片，沿用该源的代理设置；失败返回 None"""
+        kwargs = {"timeout": self.timeout, "stream": True}
+        proxies = self._feed_proxies(feed)
+        if proxies is not None:
+            kwargs["proxies"] = proxies
+        try:
+            with self.session.get(url, **kwargs) as response:
+                if response.status_code != 200 or not response.headers.get("Content-Type", "").startswith("image/"):
+                    return None
+                data = b""
+                for chunk in response.iter_content(64 * 1024):
+                    data += chunk
+                    if len(data) > 5 * 1024 * 1024:
+                        return None
+                return data
+        except requests.RequestException:
+            return None
+
+    def _request(self, feed: RSSFeedConfig):
+        """发起请求并返回响应；HTTP 错误统一抛出 requests.HTTPError 以复用重试判断"""
+        proxies = self._feed_proxies(feed)
+        if not feed.impersonate:
+            kwargs = {"timeout": self.timeout}
+            if proxies is not None:
+                kwargs["proxies"] = proxies
+            return self.session.get(feed.url, **kwargs)
+
+        use_proxy = self.use_proxy if feed.use_proxy is None else feed.use_proxy
+        session = self._get_impersonate_session()
+        try:
+            response = session.get(
+                feed.url,
+                impersonate=feed.impersonate,
+                headers=ACCEPT_HEADERS,  # 不覆盖 User-Agent，保持与 TLS 指纹一致
+                proxies={"http": self.proxy_url, "https": self.proxy_url} if use_proxy and self.proxy_url else None,
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            name = type(e).__name__
+            if "Timeout" in name:
+                raise requests.Timeout(str(e)) from e
+            raise requests.ConnectionError(f"{name}: {e}") from e
+        return _CurlResponse(response)
 
     def fetch_feed(self, feed: RSSFeedConfig) -> Tuple[List[RSSItem], Optional[str]]:
         """
@@ -96,9 +229,13 @@ class RSSFetcher:
         """
         try:
             # 瞬时请求故障只额外尝试一次，不增加等待。
+            host = urlparse(feed.url).hostname or ""
+            if host in self._rate_limited_hosts:
+                raise _HostRateLimited(host)
+
             for attempt in range(2):
                 try:
-                    response = self.session.get(feed.url, timeout=self.timeout)
+                    response = self._request(feed)
                     response.raise_for_status()
                     break
                 except requests.RequestException as e:
@@ -110,6 +247,9 @@ class RSSFetcher:
                         retryable = error_response is not None and error_response.status_code in {
                             408, 500, 502, 503, 504
                         }
+                        # 429 说明整个站点在限流，本轮不再请求同一站点的其他源
+                        if error_response is not None and error_response.status_code == 429 and host:
+                            self._rate_limited_hosts.add(host)
                     # 不提前重试带服务端等待指令的失败响应。
                     if (
                         not retryable
@@ -126,6 +266,7 @@ class RSSFetcher:
 
             # 转换为 RSSItem（使用配置的时区）
             now = get_configured_time(self.timezone)
+            archive_items(self.archive_dir, feed, parsed_items, now, fetch_bytes=lambda u: self._fetch_bytes(feed, u))
             crawl_time = now.strftime("%H:%M")
             items = []
 
@@ -150,6 +291,11 @@ class RSSFetcher:
             # 这样所有文章都会存入数据库，但旧文章不会推送
             print(f"[RSS] {feed.name}: 获取 {len(items)} 条")
             return items, None
+
+        except _HostRateLimited as e:
+            error = f"跳过：{e} 本轮已返回 429 限流"
+            print(f"[RSS] {feed.name}: {error}")
+            return [], error
 
         except requests.Timeout:
             error = f"请求超时 ({self.timeout}s)"
@@ -190,8 +336,8 @@ class RSSFetcher:
         print(f"[RSS] 开始抓取 {len(self.feeds)} 个 RSS 源...")
 
         for i, feed in enumerate(self.feeds):
-            # 请求间隔（带随机波动）
-            if i > 0:
+            # 请求间隔（带随机波动）；已限流站点的源不发请求，也不必等待
+            if i > 0 and (urlparse(feed.url).hostname or "") not in self._rate_limited_hosts:
                 interval = self.request_interval / 1000
                 jitter = random.uniform(-0.2, 0.2) * interval
                 time.sleep(interval + jitter)
@@ -245,29 +391,7 @@ class RSSFetcher:
 
         feeds = []
         for feed_config in config.get("feeds", []):
-            # 读取并验证单个 feed 的 max_age_days（可选）
-            max_age_days_raw = feed_config.get("max_age_days")
-            max_age_days = None
-            if max_age_days_raw is not None:
-                try:
-                    max_age_days = int(max_age_days_raw)
-                    if max_age_days < 0:
-                        feed_id = feed_config.get("id", "unknown")
-                        print(f"[警告] RSS feed '{feed_id}' 的 max_age_days 为负数，将使用全局默认值")
-                        max_age_days = None
-                except (ValueError, TypeError):
-                    feed_id = feed_config.get("id", "unknown")
-                    print(f"[警告] RSS feed '{feed_id}' 的 max_age_days 格式错误：{max_age_days_raw}")
-                    max_age_days = None
-
-            feed = RSSFeedConfig(
-                id=feed_config.get("id", ""),
-                name=feed_config.get("name", ""),
-                url=feed_config.get("url", ""),
-                max_items=feed_config.get("max_items", 0),  # 0=不限制
-                enabled=feed_config.get("enabled", True),
-                max_age_days=max_age_days,  # None=使用全局，0=禁用，>0=覆盖
-            )
+            feed = feed_config_from_dict(feed_config)
             if feed.id and feed.url:
                 feeds.append(feed)
 

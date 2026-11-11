@@ -90,9 +90,15 @@ def _load_notification_config(config_data: Dict) -> Dict:
     batch_size = advanced.get("batch_size", {})
 
     max_accounts_env = _get_env_int_or_none("MAX_ACCOUNTS_PER_CHANNEL")
+    dedupe = notification.get("dedupe", {}) or {}
 
     return {
         "ENABLE_NOTIFICATION": notification.get("enabled", True),
+        # 已推送记录（跨次去重），见 docs/design.md
+        "PUSH_DEDUPE": {
+            "ENABLED": bool(dedupe.get("enabled", False)),
+            "RETENTION_DAYS": dedupe.get("retention_days", 7),
+        },
         "MESSAGE_BATCH_SIZE": batch_size.get("default", 4000),
         "DINGTALK_BATCH_SIZE": batch_size.get("dingtalk", 20000),
         "FEISHU_BATCH_SIZE": batch_size.get("feishu", 29000),
@@ -419,6 +425,8 @@ def _load_webhook_config(config_data: Dict) -> Dict:
         # Telegram
         "TELEGRAM_BOT_TOKEN": _get_env_str("TELEGRAM_BOT_TOKEN") or telegram.get("bot_token", ""),
         "TELEGRAM_CHAT_ID": _get_env_str("TELEGRAM_CHAT_ID") or telegram.get("chat_id", ""),
+        "TELEGRAM_MESSAGE_THREAD_ID": _get_env_str("TELEGRAM_MESSAGE_THREAD_ID") or str(telegram.get("message_thread_id", "") or ""),
+        "TELEGRAM_STYLE": _get_env_str("TELEGRAM_STYLE") or telegram.get("style", "classic"),
         # 邮件
         "EMAIL_FROM": _get_env_str("EMAIL_FROM") or email.get("from", ""),
         "EMAIL_PASSWORD": _get_env_str("EMAIL_PASSWORD") or email.get("password", ""),

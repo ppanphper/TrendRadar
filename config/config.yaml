@@ -147,6 +147,9 @@ rss:
     #   url: "https://example.com/feed.xml"
     #   enabled: false
     #   max_age_days: 0               # 示例：禁用过滤，推送所有文章
+    #   use_proxy: true               # 可选：单独让这个源走代理（覆盖 advanced.rss.use_proxy）
+    #   impersonate: "chrome"         # 可选：模拟浏览器 TLS 指纹，用于 Cloudflare 拦截 Python 客户端的站点（如 linux.do）
+    #   archive: true                 # 可选：把条目全文存为本地快照（output/archive，网页服务 /archive/ 浏览）
 
 
 # ===============================================================
@@ -263,6 +266,12 @@ notification:
   enabled: true                       # 是否启用通知功能（true=启用, false=关闭）—— 总开关
                                       # 开启 schedule 后此项仍为总开关：false=永远不推送，true=由调度控制
 
+  # 跨次去重：推送过的新闻不再推送（跨推送、跨天），仅本地存储可用
+  # 开启后 daily 模式即为「上次推送以来未推过的内容」，适合定时摘要
+  dedupe:
+    enabled: false                    # 是否启用（true=启用, false=关闭）
+    retention_days: 7                 # 已推送记录保留天数
+
   # 推送渠道配置
   channels:
     feishu:
@@ -278,6 +287,8 @@ notification:
     telegram:
       bot_token: ""                   # Telegram Bot Token
       chat_id: ""                     # Telegram Chat ID
+      message_thread_id: ""           # 群组话题 ID（可选，发到指定话题）
+      style: "classic"                # 版式：classic=原版式，digest=摘要版式（精选 + 分组折叠，消息更少）
 
     email:
       from: ""                        # 发件人邮箱地址

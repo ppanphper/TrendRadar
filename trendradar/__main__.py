@@ -789,6 +789,25 @@ class NewsAnalyzer:
 
         return stats, html_file, ai_result, rss_items, standalone_data, rss_new_items
 
+    def _get_push_ledger(self):
+        """已推送记录；未开启或非本地存储时返回 None"""
+        if hasattr(self, "_push_ledger"):
+            return self._push_ledger
+        self._push_ledger = None
+        dedupe = self.ctx.config.get("PUSH_DEDUPE", {})
+        if dedupe.get("ENABLED"):
+            if self.storage_manager.backend_name != "local":
+                print("[推送] 跨次去重仅支持本地存储，已跳过")
+            else:
+                from trendradar.notification.ledger import PushLedger
+
+                data_dir = self.ctx.config.get("STORAGE", {}).get("LOCAL", {}).get("DATA_DIR", "output")
+                self._push_ledger = PushLedger(
+                    str(Path(data_dir) / "meta" / "push_ledger.db"),
+                    retention_days=dedupe.get("RETENTION_DAYS", 7),
+                )
+        return self._push_ledger
+
     def _send_notification_if_needed(
         self,
         stats: List[Dict],
@@ -808,6 +827,26 @@ class NewsAnalyzer:
         """统一的通知发送逻辑，包含所有判断条件，支持热榜+RSS合并推送+AI分析+独立展示区"""
         has_notification = self._has_notification_configured()
         cfg = self.ctx.config
+
+        # 即时提醒的相关度门槛与跨次去重（见 docs/design.md）
+        min_score = schedule.push_min_score if schedule else None
+        ledger = self._get_push_ledger()
+        ledger_entries: Dict[str, str] = {}
+        if (min_score is not None or ledger) and schedule and schedule.push:
+            from trendradar.notification.ledger import filter_push_content
+
+            before = sum(len(s.get("titles", [])) for s in (stats or []) + (rss_items or []))
+            stats, rss_items, rss_new_items, new_titles, standalone_data, ledger_entries = filter_push_content(
+                stats, rss_items, rss_new_items, new_titles, standalone_data,
+                ledger=ledger, min_score=min_score,
+            )
+            after = sum(len(s.get("titles", [])) for s in (stats or []) + (rss_items or []))
+            reasons = []
+            if min_score is not None:
+                reasons.append(f"相关度≥{min_score}")
+            if ledger:
+                reasons.append("去掉已推送")
+            print(f"[推送] {'、'.join(reasons)}：热榜+RSS {before} → {after} 条")
 
         # 检查是否有有效内容（热榜或RSS）
         has_news_content = self._has_valid_content(stats, new_titles)
@@ -885,6 +924,9 @@ class NewsAnalyzer:
                 ai_analysis=ai_result,
                 standalone_data=standalone_data,
                 skip_translation=True,
+                silent=bool(schedule and schedule.silent),
+                headline=schedule.period_name if schedule else None,
+                alert=min_score is not None,
             )
 
             if not results:
@@ -893,6 +935,9 @@ class NewsAnalyzer:
 
             # 记录推送成功
             if any(results.values()):
+                if ledger and ledger_entries:
+                    ledger.record(ledger_entries, self.ctx.get_time())
+                    print(f"[推送] 已记录 {len(ledger_entries)} 条已推送条目")
                 if schedule.once_push and schedule.period_key:
                     scheduler = self.ctx.create_scheduler()
                     date_str = self.ctx.format_date()
@@ -1006,34 +1051,13 @@ class NewsAnalyzer:
             return None, None, None, set()
 
         try:
-            from trendradar.crawler.rss import RSSFetcher, RSSFeedConfig
+            from trendradar.crawler.rss import RSSFetcher
+            from trendradar.crawler.rss.fetcher import feed_config_from_dict
 
             # 构建 RSS 源配置
             feeds = []
             for feed_config in rss_feeds:
-                # 读取并验证单个 feed 的 max_age_days（可选）
-                max_age_days_raw = feed_config.get("max_age_days")
-                max_age_days = None
-                if max_age_days_raw is not None:
-                    try:
-                        max_age_days = int(max_age_days_raw)
-                        if max_age_days < 0:
-                            feed_id = feed_config.get("id", "unknown")
-                            print(f"[警告] RSS feed '{feed_id}' 的 max_age_days 为负数，将使用全局默认值")
-                            max_age_days = None
-                    except (ValueError, TypeError):
-                        feed_id = feed_config.get("id", "unknown")
-                        print(f"[警告] RSS feed '{feed_id}' 的 max_age_days 格式错误：{max_age_days_raw}")
-                        max_age_days = None
-
-                feed = RSSFeedConfig(
-                    id=feed_config.get("id", ""),
-                    name=feed_config.get("name", ""),
-                    url=feed_config.get("url", ""),
-                    max_items=feed_config.get("max_items", 50),
-                    enabled=feed_config.get("enabled", True),
-                    max_age_days=max_age_days,  # None=使用全局，0=禁用，>0=覆盖
-                )
+                feed = feed_config_from_dict(feed_config, default_max_items=50)
                 if feed.id and feed.url and feed.enabled:
                     feeds.append(feed)
 
@@ -1061,6 +1085,7 @@ class NewsAnalyzer:
                 timezone=timezone,
                 freshness_enabled=freshness_enabled,
                 default_max_age_days=default_max_age_days,
+                archive_dir=str(Path(self.ctx.config.get("STORAGE", {}).get("LOCAL", {}).get("DATA_DIR", "output")) / "archive"),
             )
 
             # 抓取数据

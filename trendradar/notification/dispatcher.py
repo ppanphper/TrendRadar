@@ -258,6 +258,9 @@ class NotificationDispatcher:
         ai_analysis: Optional[AIAnalysisResult] = None,
         standalone_data: Optional[Dict] = None,
         skip_translation: bool = False,
+        silent: bool = False,
+        headline: Optional[str] = None,
+        alert: bool = False,
     ) -> Dict[str, bool]:
         """
         分发通知到所有已配置的渠道（支持热榜+RSS合并推送+AI分析+独立展示区）
@@ -274,6 +277,9 @@ class NotificationDispatcher:
             ai_analysis: AI 分析结果（可选）
             standalone_data: 独立展示区数据（可选）
             skip_translation: 跳过翻译（当数据已在上游翻译过时使用）
+            silent: 静音推送（目前仅 Telegram 支持）
+            headline: 推送标题（Telegram 摘要版式使用，如调度时段名）
+            alert: 即时提醒（Telegram 摘要版式按提醒排版）
 
         Returns:
             Dict[str, bool]: 每个渠道的发送结果，key 为渠道名，value 为是否成功
@@ -321,7 +327,8 @@ class NotificationDispatcher:
         if self.config.get("TELEGRAM_BOT_TOKEN") and self.config.get("TELEGRAM_CHAT_ID"):
             results["telegram"] = self._send_telegram(
                 report_data, report_type, update_info, proxy_url, mode, rss_items, rss_new_items,
-                ai_analysis, display_regions, standalone_data
+                ai_analysis, display_regions, standalone_data,
+                silent=silent, headline=headline, alert=alert,
             )
 
         # ntfy（需要配对验证）
@@ -552,6 +559,9 @@ class NotificationDispatcher:
         ai_analysis: Optional[AIAnalysisResult] = None,
         display_regions: Optional[Dict] = None,
         standalone_data: Optional[Dict] = None,
+        silent: bool = False,
+        headline: Optional[str] = None,
+        alert: bool = False,
     ) -> bool:
         """发送到 Telegram（多账号，需验证 token 和 chat_id 配对，支持热榜+RSS合并+AI分析+独立展示区）"""
         report_data, rss_items, rss_new_items, ai_analysis, standalone_data = self._apply_display_regions(
@@ -575,6 +585,8 @@ class NotificationDispatcher:
 
         telegram_tokens = limit_accounts(telegram_tokens, self.max_accounts, "Telegram")
         telegram_chat_ids = telegram_chat_ids[: len(telegram_tokens)]
+        # 话题 ID 与 chat_id 按顺序对应；只填一个时所有账号共用
+        thread_ids = parse_multi_account_config(self.config.get("TELEGRAM_MESSAGE_THREAD_ID", ""))
 
         results = []
         for i in range(len(telegram_tokens)):
@@ -599,6 +611,12 @@ class NotificationDispatcher:
                     ai_analysis=ai_analysis,
                     display_regions=display_regions,
                     standalone_data=standalone_data,
+                    message_thread_id=(thread_ids[i] if i < len(thread_ids) else thread_ids[0]) if thread_ids else "",
+                    style=self.config.get("TELEGRAM_STYLE", "classic"),
+                    silent=silent,
+                    headline=headline,
+                    alert=alert,
+                    get_time_func=self.get_time_func,
                 )
                 results.append(result)
 
