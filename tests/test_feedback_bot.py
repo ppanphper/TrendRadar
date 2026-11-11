@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from trendradar.bot import FeedbackBot
@@ -31,7 +31,7 @@ class BotTest(unittest.TestCase):
         }
         self.bot = FeedbackBot(self.config)
         self.calls = []
-        self.bot.api = lambda method, timeout=30, **payload: self.calls.append((method, payload)) or {}
+        self.bot.api = lambda method, http_timeout=30, **payload: self.calls.append((method, payload)) or {}
         self.bot.now = lambda: NOW
         self.bot.store.save_message("-100", 10, ITEMS, NOW)
 
@@ -97,6 +97,20 @@ class BotTest(unittest.TestCase):
         self.assertEqual([c for c in self.calls if c[0] == "sendMessage"], [])
         # 已记占位，本周不再检查
         self.assertIsNotNone(self.bot.store.last_suggestion_at())
+
+    def test_poll_once_sends_long_poll_timeout_and_advances_offset(self):
+        bot = FeedbackBot(self.config)
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"ok": True, "result": [
+            {"update_id": 41, "message": {"text": "hi", "chat": {"id": -100}, "from": {"id": 7}}},
+        ]}
+        bot.session = session
+        self.assertEqual(bot.poll_once(timeout=50), 1)
+        kwargs = session.post.call_args.kwargs
+        self.assertEqual(kwargs["json"]["timeout"], 50)
+        self.assertEqual(kwargs["json"]["allowed_updates"], ["callback_query", "message"])
+        self.assertEqual(kwargs["timeout"], 60)
+        self.assertEqual(bot.offset, 42)
 
     def test_prompt_section_and_grid_cap(self):
         store = FeedbackStore(feedback_db_path(self.config["STORAGE"]["LOCAL"]["DATA_DIR"]))
