@@ -64,10 +64,11 @@ class FeedbackBot:
 
     # --- Telegram API ---
 
-    def api(self, method: str, timeout: int = 30, **payload):
+    def api(self, method: str, http_timeout: int = 30, **payload):
+        # http_timeout 是本地请求超时；payload 里的 timeout 是 getUpdates 长轮询的服务端等待时间
         response = self.session.post(
             f"https://api.telegram.org/bot{self.token}/{method}",
-            json=payload, proxies=self.proxies, timeout=timeout,
+            json=payload, proxies=self.proxies, timeout=http_timeout,
         )
         try:
             data = response.json()
@@ -95,7 +96,7 @@ class FeedbackBot:
         payload = {"timeout": timeout, "allowed_updates": ["callback_query", "message"]}
         if self.offset is not None:
             payload["offset"] = self.offset
-        updates = self.api("getUpdates", timeout=timeout + 10, **payload)
+        updates = self.api("getUpdates", http_timeout=timeout + 10, **payload)
         for update in updates:
             self.offset = update["update_id"] + 1
             try:
