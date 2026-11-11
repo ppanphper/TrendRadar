@@ -1,0 +1,343 @@
+# coding=utf-8
+"""
+推送反馈 bot：长轮询接收 Telegram 按钮回调
+
+- 👍 / 👎 按钮：展开本条消息的编号网格，点编号记录反馈，再点取消
+- 每周日 21:00 后或收到 /interests：根据反馈生成兴趣描述修改建议，点「应用」写入 ai_filter.interests_path
+
+运行：python -m trendradar.bot（需要独立 bot：同一 bot 只能有一个轮询方，且不能设置 webhook）
+设计说明见 docs/design.md 第 7 节。
+"""
+
+import difflib
+import html
+import json
+import os
+import re
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import requests
+
+from trendradar.core.config import parse_multi_account_config
+from trendradar.notification.feedback import (
+    LABELS,
+    FeedbackStore,
+    base_keyboard,
+    feedback_db_path,
+    grid_keyboard,
+    suggestion_keyboard,
+)
+from trendradar.utils.time import DEFAULT_TIMEZONE, get_configured_time
+
+POLL_TIMEOUT = 50
+WEEKLY_WEEKDAY = 7       # 周日
+WEEKLY_HOUR = 21
+MIN_FEEDBACK_FOR_SUGGESTION = 3
+
+
+class TelegramError(Exception):
+    def __init__(self, status: int, description: str):
+        super().__init__(f"{status}: {description}")
+        self.status = status
+        self.description = description
+
+
+class FeedbackBot:
+    def __init__(self, config: Dict, session: Optional[requests.Session] = None):
+        self.config = config
+        tokens = parse_multi_account_config(config.get("TELEGRAM_BOT_TOKEN", ""))
+        self.token = tokens[0] if tokens else ""
+        self.chat_ids = {c for c in parse_multi_account_config(config.get("TELEGRAM_CHAT_ID", "")) if c}
+        threads = parse_multi_account_config(config.get("TELEGRAM_MESSAGE_THREAD_ID", ""))
+        self.thread_id = threads[0] if threads else ""
+        self.allowed_users = {u for u in parse_multi_account_config(config.get("TELEGRAM_FEEDBACK_USER_IDS", "")) if u}
+        self.timezone = config.get("TIMEZONE", DEFAULT_TIMEZONE)
+        data_dir = config.get("STORAGE", {}).get("LOCAL", {}).get("DATA_DIR", "output")
+        self.store = FeedbackStore(feedback_db_path(data_dir))
+        self.session = session or requests.Session()
+        proxy = config.get("DEFAULT_PROXY") if config.get("USE_PROXY") else None
+        self.proxies = {"http": proxy, "https": proxy} if proxy else None
+        self.offset: Optional[int] = None
+
+    # --- Telegram API ---
+
+    def api(self, method: str, timeout: int = 30, **payload):
+        response = self.session.post(
+            f"https://api.telegram.org/bot{self.token}/{method}",
+            json=payload, proxies=self.proxies, timeout=timeout,
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            raise TelegramError(response.status_code, response.text[:200])
+        if not data.get("ok"):
+            raise TelegramError(response.status_code, data.get("description", ""))
+        return data.get("result")
+
+    def now(self) -> datetime:
+        return get_configured_time(self.timezone)
+
+    # --- 轮询 ---
+
+    def check_ready(self) -> bool:
+        info = self.api("getWebhookInfo")
+        if info.get("url"):
+            print("[反馈bot] 该 bot 设置了 webhook，无法用 getUpdates 轮询；请确认这是独立 bot 后再删除 webhook")
+            return False
+        me = self.api("getMe")
+        print(f"[反馈bot] 已连接 @{me.get('username')}，监听 chat: {', '.join(sorted(self.chat_ids))}")
+        return True
+
+    def poll_once(self, timeout: int = POLL_TIMEOUT) -> int:
+        payload = {"timeout": timeout, "allowed_updates": ["callback_query", "message"]}
+        if self.offset is not None:
+            payload["offset"] = self.offset
+        updates = self.api("getUpdates", timeout=timeout + 10, **payload)
+        for update in updates:
+            self.offset = update["update_id"] + 1
+            try:
+                self.handle_update(update)
+            except Exception as e:
+                print(f"[反馈bot] 处理更新 {update.get('update_id')} 失败: {type(e).__name__}: {e}")
+        return len(updates)
+
+    def run_forever(self) -> None:
+        while True:
+            try:
+                if self.check_ready():
+                    break
+            except Exception as e:
+                print(f"[反馈bot] 连接 Telegram 失败: {e}")
+            time.sleep(300)
+
+        backoff = 5
+        while True:
+            try:
+                self.poll_once()
+                backoff = 5
+                self.maybe_weekly_suggestion()
+            except TelegramError as e:
+                if e.status == 409:
+                    print("[反馈bot] 409 冲突：另有程序在用同一 bot 轮询或设置了 webhook，30 秒后重试")
+                    time.sleep(30)
+                else:
+                    print(f"[反馈bot] Telegram 返回错误: {e}")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 300)
+            except requests.RequestException as e:
+                print(f"[反馈bot] 网络错误: {e.__class__.__name__}，{backoff} 秒后重试")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+
+    # --- 更新处理 ---
+
+    def _authorized(self, chat_id, user_id) -> bool:
+        if str(chat_id) not in self.chat_ids:
+            return False
+        return not self.allowed_users or str(user_id) in self.allowed_users
+
+    def handle_update(self, update: Dict) -> None:
+        if "callback_query" in update:
+            self.handle_callback(update["callback_query"])
+        elif "message" in update:
+            self.handle_message(update["message"])
+
+    def handle_callback(self, cq: Dict) -> None:
+        message = cq.get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        message_id = message.get("message_id")
+        user_id = (cq.get("from") or {}).get("id")
+        data = cq.get("data") or ""
+        if not self._authorized(chat_id, user_id):
+            self.api("answerCallbackQuery", callback_query_id=cq["id"], text="没有权限")
+            return
+
+        def answer(text: str = ""):
+            self.api("answerCallbackQuery", callback_query_id=cq["id"], text=text[:200])
+
+        def set_markup(markup: Dict):
+            try:
+                self.api("editMessageReplyMarkup", chat_id=chat_id, message_id=message_id, reply_markup=markup)
+            except TelegramError as e:
+                if "not modified" not in e.description:
+                    raise
+
+        if data in ("fb:l", "fb:d"):
+            code = data[-1]
+            items = self.store.message_items(chat_id, message_id)
+            if not items:
+                answer("这条消息没有可反馈的条目")
+                return
+            selected = self.store.selected(chat_id, message_id, LABELS[code])
+            set_markup(grid_keyboard([i["n"] for i in items], code, selected))
+            answer("点编号标记" + ("感兴趣" if code == "l" else "不感兴趣") + "，再点取消")
+        elif data.startswith("fv:"):
+            _, code, n = data.split(":")
+            items = self.store.message_items(chat_id, message_id)
+            item = next((i for i in items if i["n"] == int(n)), None)
+            if not item:
+                answer("找不到这条")
+                return
+            label = LABELS[code]
+            on = self.store.toggle(chat_id, message_id, item, label, user_id, self.now())
+            icon = "👍" if label == "like" else "👎"
+            answer(f"{icon} {item['title']}" if on else f"已取消：{item['title']}")
+            set_markup(grid_keyboard([i["n"] for i in items], code, self.store.selected(chat_id, message_id, label)))
+        elif data == "fb:back":
+            set_markup(base_keyboard())
+            answer()
+        elif data.startswith("sg:"):
+            _, action, sid = data.split(":")
+            if action == "a":
+                text = self.apply_suggestion(int(sid))
+            else:
+                self.store.set_suggestion_status(int(sid), "skipped")
+                text = "已忽略"
+            set_markup({"inline_keyboard": []})
+            answer(text)
+        else:
+            answer()
+
+    def handle_message(self, message: Dict) -> None:
+        text = (message.get("text") or "").strip()
+        chat_id = (message.get("chat") or {}).get("id")
+        user_id = (message.get("from") or {}).get("id")
+        if not re.match(r"^/interests(@\w+)?\b", text) or not self._authorized(chat_id, user_id):
+            return
+        thread = message.get("message_thread_id")
+        result = self.create_suggestion(manual=True)
+        if isinstance(result, str):
+            self.send(result, chat_id=chat_id, thread_id=thread)
+
+    # --- 兴趣调整建议 ---
+
+    def interests_path(self) -> Optional[Path]:
+        from trendradar.ai.filter import AIFilter
+
+        return AIFilter.resolve_interests_path(self.config.get("AI_FILTER", {}).get("INTERESTS_PATH"))
+
+    def current_interests(self) -> str:
+        path = self.interests_path()
+        if path and path.exists():
+            return path.read_text(encoding="utf-8").strip()
+        default = Path(__file__).parent.parent / "config" / "ai_interests.txt"
+        return default.read_text(encoding="utf-8").strip() if default.exists() else ""
+
+    def maybe_weekly_suggestion(self) -> None:
+        now = self.now()
+        if now.isoweekday() != WEEKLY_WEEKDAY or now.hour < WEEKLY_HOUR:
+            return
+        last = self.store.last_suggestion_at()
+        if last and last > (now - timedelta(days=6)).strftime("%Y-%m-%d %H:%M:%S"):
+            return
+        self.create_suggestion(manual=False)
+
+    def create_suggestion(self, manual: bool):
+        """生成建议并发到话题；返回建议 ID，或说明未生成原因的字符串"""
+        now = self.now()
+        since = self.store.last_suggestion_at()
+        liked = self.store.recent("like", 50, since=since)
+        disliked = self.store.recent("dislike", 50, since=since)
+        if len(liked) + len(disliked) < MIN_FEEDBACK_FOR_SUGGESTION:
+            msg = f"上次建议以来只有 {len(liked) + len(disliked)} 条反馈，至少 {MIN_FEEDBACK_FOR_SUGGESTION} 条才生成建议"
+            if not manual:
+                # 记一条占位，本周不再重复检查
+                self.store.set_suggestion_status(self.store.add_suggestion(msg, "", now), "noop")
+            return msg
+
+        current = self.current_interests()
+        try:
+            proposal = self._ask_ai(current, liked, disliked)
+        except Exception as e:
+            print(f"[反馈bot] 生成兴趣建议失败: {type(e).__name__}: {e}")
+            return "生成建议失败，稍后再试"
+        new_text = (proposal.get("interests") or "").strip()
+        summary = (proposal.get("summary") or "").strip()
+        if not new_text or new_text == current:
+            sid = self.store.add_suggestion(summary or "无需修改", new_text or current, now)
+            self.store.set_suggestion_status(sid, "noop")
+            return "根据近期反馈，兴趣描述无需调整"
+
+        sid = self.store.add_suggestion(summary, new_text, now)
+        diff = [
+            f"{line[0]} {line[1:]}"
+            for line in difflib.unified_diff(current.splitlines(), new_text.splitlines(), lineterm="", n=0)
+            if line[:1] in "+-" and not line.startswith(("+++", "---"))
+        ][:40]
+        text = (
+            f"<b>🧭 兴趣调整建议</b>\n依据 {len(liked)} 条感兴趣、{len(disliked)} 条不感兴趣的反馈\n\n"
+            f"{html.escape(summary)}\n\n"
+            "<blockquote expandable>" + html.escape("\n".join(diff) or "（仅格式调整）") + "</blockquote>"
+        )
+        self.send(text, reply_markup=suggestion_keyboard(sid))
+        return sid
+
+    def _ask_ai(self, current: str, liked: List[Dict], disliked: List[Dict]) -> Dict:
+        from trendradar.ai.client import AIClient
+        from trendradar.ai.prompt_loader import load_prompt_template
+
+        system, user = load_prompt_template("ai_interests_update_prompt.txt", label="反馈bot")
+        fmt = lambda items: "\n".join(f"- [{i['group'] or i['source']}] {i['title']}" for i in items) or "（无）"
+        user = user.replace("{interests_content}", current).replace("{liked}", fmt(liked)).replace("{disliked}", fmt(disliked))
+        messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+        reply = AIClient(self.config.get("AI", {})).chat(messages)
+        match = re.search(r"\{.*\}", reply or "", re.S)
+        if not match:
+            raise ValueError("AI 返回中没有 JSON")
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            from json_repair import repair_json
+
+            return repair_json(match.group(0), return_objects=True)
+
+    def apply_suggestion(self, suggestion_id: int) -> str:
+        suggestion = self.store.suggestion(suggestion_id)
+        if not suggestion or suggestion["status"] != "pending":
+            return "这条建议已处理过"
+        path = self.interests_path()
+        if not path:
+            return "未配置 ai_filter.interests_path，无法写入"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            backup_dir = path.parent / "backups"
+            backup_dir.mkdir(exist_ok=True)
+            stamp = self.now().strftime("%Y%m%d-%H%M%S")
+            (backup_dir / f"{path.stem}-{stamp}{path.suffix}").write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(suggestion["content"].rstrip() + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        self.store.set_suggestion_status(suggestion_id, "applied")
+        return "已应用，下一轮抓取按新兴趣重建标签"
+
+    def send(self, text: str, chat_id=None, thread_id=None, reply_markup: Optional[Dict] = None) -> None:
+        payload = {
+            "chat_id": chat_id or sorted(self.chat_ids)[0],
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        thread = thread_id or self.thread_id
+        if thread:
+            payload["message_thread_id"] = int(thread) if str(thread).isdigit() else thread
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        self.api("sendMessage", **payload)
+
+
+def main() -> None:
+    from trendradar.core.loader import load_config
+
+    config = load_config()
+    bot = FeedbackBot(config)
+    if not bot.token or not bot.chat_ids:
+        print("[反馈bot] 未配置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，退出")
+        return
+    bot.run_forever()
+
+
+if __name__ == "__main__":
+    main()

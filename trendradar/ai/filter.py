@@ -9,6 +9,7 @@ AI 智能筛选模块
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -74,6 +75,17 @@ class AIFilter:
         normalized = "\n".join(lines)
         content_hash = hashlib.md5(normalized.encode("utf-8")).hexdigest()
         return f"{filename}:{content_hash}"
+
+    @staticmethod
+    def resolve_interests_path(path_value: Optional[str]) -> Optional[Path]:
+        """解析 ai_filter.interests_path：相对路径相对 config.yaml 所在目录"""
+        if not path_value:
+            return None
+        path = Path(path_value)
+        if not path.is_absolute():
+            config_path = os.environ.get("CONFIG_PATH", "config/config.yaml")
+            path = Path(config_path).parent / path
+        return path
 
     def load_interests_content(self, interests_file: Optional[str] = None) -> Optional[str]:
         """加载兴趣描述文件内容

@@ -200,6 +200,7 @@ ai_filter:
                                           # 推荐 0.5~0.7 起步，0=不过滤
 
   # 兴趣描述文件（默认 config/ai_interests.txt，无需配置）
+  # interests_path: "ai_interests.txt"  # 可选：默认兴趣文件的可写副本（相对 config.yaml 所在目录），反馈 bot 应用兴趣调整时写入这里
   # 自定义文件放入 config/custom/ai/ 目录，然后指定文件名：
   # interests_file: "finance.txt"    # → 加载 config/custom/ai/finance.txt
 
@@ -272,6 +273,11 @@ notification:
     enabled: false                    # 是否启用（true=启用, false=关闭）
     retention_days: 7                 # 已推送记录保留天数
 
+  # 事件归并：不同平台对同一事件的报道合并为一条（字面相似度归并，定时摘要时再由 AI 归并）
+  event_merge:
+    enabled: false                    # 是否启用（true=启用, false=关闭）
+    ai: true                          # 定时摘要时调用 AI 归并（每次摘要多一次 AI 调用）；提醒只用字面归并
+
   # 推送渠道配置
   channels:
     feishu:
@@ -289,6 +295,8 @@ notification:
       chat_id: ""                     # Telegram Chat ID
       message_thread_id: ""           # 群组话题 ID（可选，发到指定话题）
       style: "classic"                # 版式：classic=原版式，digest=摘要版式（精选 + 分组折叠，消息更少）
+      feedback: false                 # 摘要下方显示 👍/👎 按钮（需运行 python -m trendradar.bot，且使用独立 bot）
+      feedback_user_ids: ""           # 允许反馈的 Telegram 用户 ID，多个用 ; 分隔；留空=群内所有人
 
     email:
       from: ""                        # 发件人邮箱地址

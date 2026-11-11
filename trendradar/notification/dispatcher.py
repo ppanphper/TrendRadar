@@ -617,10 +617,20 @@ class NotificationDispatcher:
                     headline=headline,
                     alert=alert,
                     get_time_func=self.get_time_func,
+                    feedback_db=self._feedback_db_path(),
                 )
                 results.append(result)
 
         return any(results) if results else False
+
+    def _feedback_db_path(self) -> Optional[str]:
+        """开启 Telegram 反馈按钮时返回反馈库路径（仅本地存储）"""
+        if not self.config.get("TELEGRAM_FEEDBACK"):
+            return None
+        from trendradar.notification.feedback import feedback_db_path
+
+        data_dir = self.config.get("STORAGE", {}).get("LOCAL", {}).get("DATA_DIR", "output")
+        return str(feedback_db_path(data_dir))
 
     def _send_ntfy(
         self,

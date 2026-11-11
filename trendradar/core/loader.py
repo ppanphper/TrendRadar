@@ -333,6 +333,8 @@ def _load_ai_filter_config(config_data: Dict) -> Dict:
         "BATCH_SIZE": ai_filter.get("batch_size", 200),
         "BATCH_INTERVAL": ai_filter.get("batch_interval", 5),
         "INTERESTS_FILE": ai_filter.get("interests_file"),  # None = 使用默认 config/ai_interests.txt
+        # 默认兴趣文件的可写位置（相对路径相对 config.yaml 所在目录），供反馈按钮应用兴趣调整；文件不存在时回退 config/ai_interests.txt
+        "INTERESTS_PATH": ai_filter.get("interests_path", ""),
         "PROMPT_FILE": ai_filter.get("prompt_file", "prompt.txt"),
         "EXTRACT_PROMPT_FILE": ai_filter.get("extract_prompt_file", "extract_prompt.txt"),
         "UPDATE_TAGS_PROMPT_FILE": ai_filter.get("update_tags_prompt_file", "update_tags_prompt.txt"),
@@ -434,6 +436,8 @@ def _load_webhook_config(config_data: Dict) -> Dict:
         "TELEGRAM_CHAT_ID": _get_env_str("TELEGRAM_CHAT_ID") or telegram.get("chat_id", ""),
         "TELEGRAM_MESSAGE_THREAD_ID": _get_env_str("TELEGRAM_MESSAGE_THREAD_ID") or str(telegram.get("message_thread_id", "") or ""),
         "TELEGRAM_STYLE": _get_env_str("TELEGRAM_STYLE") or telegram.get("style", "classic"),
+        "TELEGRAM_FEEDBACK": _get_env_bool("TELEGRAM_FEEDBACK") if _get_env_bool("TELEGRAM_FEEDBACK") is not None else bool(telegram.get("feedback", False)),
+        "TELEGRAM_FEEDBACK_USER_IDS": _get_env_str("TELEGRAM_FEEDBACK_USER_IDS") or str(telegram.get("feedback_user_ids", "") or ""),
         # 邮件
         "EMAIL_FROM": _get_env_str("EMAIL_FROM") or email.get("from", ""),
         "EMAIL_PASSWORD": _get_env_str("EMAIL_PASSWORD") or email.get("password", ""),
