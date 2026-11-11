@@ -144,6 +144,8 @@ class RSSArchiver:
         """保存尚未存档的条目，返回新增快照数量"""
         manifest = self._load_manifest()
         known = {entry["path"] for entry in manifest}
+        # 同一条目可能出现在多个源（如分类源和 top），按条目标识跨源去重
+        known_digests = {Path(entry["path"]).stem for entry in manifest}
         added = 0
         for item in items:
             content = getattr(item, "content_html", None)
@@ -154,7 +156,7 @@ class RSSArchiver:
             published = local_time(item.published_at, now)
             month = (published or now.strftime("%Y-%m"))[:7]
             rel_path = f"{feed_id}/{month}/{digest}.html"
-            if rel_path in known or (self.root / rel_path).exists():
+            if digest in known_digests or rel_path in known or (self.root / rel_path).exists():
                 continue
 
             meta = " · ".join(p for p in [
@@ -185,6 +187,7 @@ class RSSArchiver:
                 "path": rel_path,
             })
             known.add(rel_path)
+            known_digests.add(digest)
             added += 1
 
         if added:

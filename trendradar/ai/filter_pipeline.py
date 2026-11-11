@@ -49,6 +49,23 @@ class AIFilterPipeline:
 
         self._feed_max_age_map = self._build_feed_max_age_map()
 
+    def _feedback_section(self) -> str:
+        """读取推送反馈；没有反馈库或读取失败时返回空串"""
+        from trendradar.notification.feedback import FeedbackStore, feedback_db_path
+
+        data_dir = self.config.get("STORAGE", {}).get("LOCAL", {}).get("DATA_DIR", "output")
+        path = feedback_db_path(data_dir)
+        if not path.exists():
+            return ""
+        try:
+            section = FeedbackStore(path).prompt_section()
+        except Exception as e:
+            print(f"[AI筛选] 读取推送反馈失败: {e}")
+            return ""
+        if section:
+            print("[AI筛选] 分类时附带用户反馈")
+        return section
+
     def _build_feed_max_age_map(self) -> Dict[str, int]:
         result = {}
         for feed_cfg in self._rss_feeds:
@@ -88,8 +105,13 @@ class AIFilterPipeline:
             print(f"[AI筛选][DEBUG] prompt_file={filter_config.get('PROMPT_FILE', 'prompt.txt')}")
             print(f"[AI筛选][DEBUG] extract_prompt_file={filter_config.get('EXTRACT_PROMPT_FILE', 'extract_prompt.txt')}")
 
-        # 1. 读取兴趣描述
-        interests_content = ai_filter.load_interests_content(configured_interests)
+        # 1. 读取兴趣描述（默认兴趣文件优先使用 interests_path 指向的可写副本）
+        interests_content = None
+        override = ai_filter.resolve_interests_path(filter_config.get("INTERESTS_PATH")) if not configured_interests else None
+        if override and override.exists():
+            interests_content = override.read_text(encoding="utf-8").strip() or None
+        if not interests_content:
+            interests_content = ai_filter.load_interests_content(configured_interests)
         if not interests_content:
             return AIFilterResult(success=False, error="兴趣描述文件为空或不存在")
 
@@ -141,8 +163,10 @@ class AIFilterPipeline:
             print("[AI筛选] 没有新增新闻需要分类")
 
         # 5. 批量分类
+        # 分类时附上最近的感兴趣 / 不感兴趣反馈（不参与 hash，不触发标签重建）
         total_results, succeeded_news_ids, succeeded_rss_ids = self._classify_batches(
-            ai_filter, pending_news, pending_rss, active_tags, interests_content, filter_config,
+            ai_filter, pending_news, pending_rss, active_tags,
+            interests_content + self._feedback_section() if total_pending else interests_content, filter_config,
         )
 
         # 6. 保存结果

@@ -24,7 +24,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -470,6 +470,19 @@ def send_to_wework(
     return True
 
 
+def _save_feedback_mapping(feedback_db: str, chat_id: str, result: Dict, items: List[Dict], get_time_func) -> None:
+    """记录消息与条目的映射，供反馈按钮回调查找；失败不影响推送"""
+    try:
+        from trendradar.notification.feedback import FeedbackStore
+
+        message_id = (result.get("result") or {}).get("message_id")
+        if message_id:
+            now = get_time_func() if get_time_func else datetime.now()
+            FeedbackStore(feedback_db).save_message(chat_id, message_id, items, now)
+    except Exception as e:
+        print(f"[反馈] 保存消息映射失败: {e}")
+
+
 def send_to_telegram(
     bot_token: str,
     chat_id: str,
@@ -494,6 +507,7 @@ def send_to_telegram(
     headline: Optional[str] = None,
     alert: bool = False,
     get_time_func: Optional[Callable] = None,
+    feedback_db: Optional[str] = None,
 ) -> bool:
     """
     发送到 Telegram（支持分批发送，支持热榜+RSS合并+独立展示区）
@@ -517,6 +531,7 @@ def send_to_telegram(
         silent: 静音推送（disable_notification）
         headline: 摘要版式的标题（如调度时段名）
         alert: 摘要版式下按即时提醒排版
+        feedback_db: 反馈库路径；摘要版式下设置后附带感兴趣 / 不感兴趣按钮并记录消息与条目的映射
 
     Returns:
         bool: 发送是否成功
@@ -535,16 +550,19 @@ def send_to_telegram(
     ai_content = _render_ai_analysis(ai_analysis, "telegram") if ai_analysis else None
     ai_stats = _extract_ai_stats(ai_analysis)
 
+    batch_items: List[List[Dict]] = []
     if style == "digest":
-        from trendradar.notification.telegram_digest import build_telegram_digest
+        from trendradar.notification.telegram_digest import build_telegram_digest_messages
 
-        batches = build_telegram_digest(
+        digest = build_telegram_digest_messages(
             report_data, rss_items, standalone_data, ai_content,
             mode=mode,
             now=get_time_func() if get_time_func else None,
             headline=headline,
             alert=alert,
         )
+        batches = [m.text for m in digest]
+        batch_items = [m.items for m in digest]
         if not batches:
             print(f"{log_prefix}没有可推送的内容，跳过 [{report_type}]")
             return False
@@ -583,6 +601,11 @@ def send_to_telegram(
             payload["message_thread_id"] = int(message_thread_id) if str(message_thread_id).isdigit() else message_thread_id
         if silent:
             payload["disable_notification"] = True
+        items = batch_items[i - 1] if feedback_db and i <= len(batch_items) else []
+        if items:
+            from trendradar.notification.feedback import base_keyboard
+
+            payload["reply_markup"] = base_keyboard()
 
         try:
             response = requests.post(
@@ -602,6 +625,8 @@ def send_to_telegram(
                 result = response.json()
                 if result.get("ok"):
                     print(f"{log_prefix}第 {i}/{len(batches)} 批次发送成功 [{report_type}]")
+                    if items:
+                        _save_feedback_mapping(feedback_db, chat_id, result, items, get_time_func)
                     # 批次间间隔
                     if i < len(batches):
                         time.sleep(batch_interval)

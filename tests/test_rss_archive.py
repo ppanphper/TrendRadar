@@ -80,6 +80,11 @@ class ArchiveTest(unittest.TestCase):
         self.assertIn('src="https://cdn3.ldstatic.com/missing.png"', page)
         self.assertNotIn("srcset", page)
 
+    def test_same_item_in_two_feeds_is_saved_once(self):
+        archiver = RSSArchiver(str(self.root))
+        self.assertEqual(archiver.save("linux-do-34", "前沿快讯", self.items, NOW), 1)
+        self.assertEqual(archiver.save("linux-do-top", "Top", self.items, NOW), 0)
+
     def test_sanitize_removes_scripts_and_handlers(self):
         cleaned = sanitize_html('<a href="javascript:x()" onclick="y()">a</a><iframe src="z"></iframe><b>ok</b>')
         self.assertNotIn("javascript:", cleaned)

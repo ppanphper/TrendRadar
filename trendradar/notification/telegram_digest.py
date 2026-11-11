@@ -112,10 +112,11 @@ def collect_groups(report_data: Dict, rss_items: Optional[List[Dict]]) -> Dict[s
                     if score is not None and (existing.score is None or score > existing.score):
                         existing.score = score
                     continue
+                event_sources = [x for x in (data.get("event_sources") or []) if x]
                 item = DigestItem(
-                    title=title,
+                    title=data.get("event_headline") or title,
                     url=data.get("mobile_url") or data.get("url", ""),
-                    sources=[source] if source else [],
+                    sources=event_sources or ([source] if source else []),
                     group=group,
                     rank=rank,
                     score=score,
@@ -128,23 +129,39 @@ def collect_groups(report_data: Dict, rss_items: Optional[List[Dict]]) -> Dict[s
     return groups
 
 
-def _item_line(item: DigestItem, show_group: bool = False) -> str:
+def _number(n: Optional[int]) -> str:
+    # 编号用等宽样式，便于对照反馈按钮，也不会与 AI 分析里的列表序号混淆
+    return f"<code>{n}</code> " if n is not None else "• "
+
+
+def _item_line(item: DigestItem, show_group: bool = False, n: Optional[int] = None) -> str:
     title = _esc(item.title)
     link = f'<a href="{_attr(item.url)}">{title}</a>' if item.url else title
     meta = " / ".join(item.sources[:3])
+    if len(item.sources) > 3:
+        meta += f" 等 {len(item.sources)} 家"
     if item.rank is not None:
         meta = f"{meta} #{item.rank}" if meta else f"#{item.rank}"
     if show_group and item.group:
         meta = f"{meta} · {item.group}" if meta else item.group
-    return f"• {link} <i>{_esc(meta)}</i>" if meta else f"• {link}"
+    return f"{_number(n)}{link} <i>{_esc(meta)}</i>" if meta else f"{_number(n)}{link}"
 
 
-def _standalone_line(data: Dict) -> str:
+def _standalone_line(data: Dict, n: Optional[int] = None) -> str:
     title = _esc(data.get("title", ""))
     url = data.get("mobile_url") or data.get("url", "")
     link = f'<a href="{_attr(url)}">{title}</a>' if url else title
     rank = data.get("rank")
-    return f"• {link} <i>#{rank}</i>" if isinstance(rank, int) and rank > 0 else f"• {link}"
+    return f"{_number(n)}{link} <i>#{rank}</i>" if isinstance(rank, int) and rank > 0 else f"{_number(n)}{link}"
+
+
+_NUMBER_RE = re.compile(r"(?:^|\n|<blockquote expandable>)<code>(\d+)</code> ")
+
+
+@dataclass
+class DigestMessage:
+    text: str
+    items: List[Dict] = field(default_factory=list)   # 本条消息中带编号的条目：n、title、url、source、group
 
 
 def _render_block(block: _Block, lines: List[str], folded: List[str], heading_suffix: str = "") -> str:
@@ -197,13 +214,18 @@ def _split_raw(raw: str, first_limit: int, limit: int) -> List[str]:
     return chunks
 
 
-def _fold_lines(lines: List[str], per_group: int, max_folded: int) -> Tuple[List[str], List[str]]:
-    """前 per_group 条直接显示，其余折叠；折叠部分超过 max_folded 时只留数量提示"""
-    shown, folded = lines[:per_group], lines[per_group:]
+def _fold(items: List, per_group: int, max_folded: int) -> Tuple[List, List, int]:
+    """前 per_group 条直接显示，其余折叠；折叠部分超过 max_folded 时只留数量"""
+    shown, folded = items[:per_group], items[per_group:]
+    hidden = 0
     if max_folded >= 0 and len(folded) > max_folded:
         hidden = len(folded) - max_folded
-        folded = folded[:max_folded] + [f"<i>…另有 {hidden} 条，见网页报告</i>"]
-    return shown, folded
+        folded = folded[:max_folded]
+    return shown, folded, hidden
+
+
+def _hidden_line(hidden: int) -> List[str]:
+    return [f"<i>…另有 {hidden} 条，见网页报告</i>"] if hidden else []
 
 
 def build_telegram_digest(
@@ -222,6 +244,29 @@ def build_telegram_digest(
     limit: int = TELEGRAM_TEXT_LIMIT,
 ) -> List[str]:
     """生成 Telegram 摘要消息（HTML），返回按上限切好的消息列表；无内容时返回空列表"""
+    return [m.text for m in build_telegram_digest_messages(
+        report_data, rss_items, standalone_data, ai_content,
+        mode=mode, now=now, headline=headline, alert=alert,
+        picks=picks, per_group=per_group, max_folded=max_folded, limit=limit,
+    )]
+
+
+def build_telegram_digest_messages(
+    report_data: Dict,
+    rss_items: Optional[List[Dict]] = None,
+    standalone_data: Optional[Dict] = None,
+    ai_content: Optional[str] = None,
+    *,
+    mode: str = "daily",
+    now: Optional[datetime] = None,
+    headline: Optional[str] = None,
+    alert: bool = False,
+    picks: int = 5,
+    per_group: int = 3,
+    max_folded: int = 10,
+    limit: int = TELEGRAM_TEXT_LIMIT,
+) -> List[DigestMessage]:
+    """同 build_telegram_digest，另外返回每条消息中带编号的条目，供反馈按钮使用"""
     now = now or datetime.now()
     groups = collect_groups(report_data, rss_items)
     all_items = [item for items in groups.values() for item in items]
@@ -252,25 +297,48 @@ def build_telegram_digest(
     title_line = f"<b>{icon} {_esc(label)} · {now.strftime('%m-%d %H:%M')}</b>"
     header = title_line + ("\n" + " · ".join(counts) if counts else "")
 
+    registry: Dict[int, Dict] = {}
+
+    def number(title: str, url: str, sources: List[str], group: str) -> int:
+        n = len(registry) + 1
+        registry[n] = {"n": n, "title": title, "url": url, "source": " / ".join(sources[:3]), "group": group}
+        return n
+
+    def item_line(item: DigestItem, show_group: bool = False) -> str:
+        return _item_line(item, show_group, number(item.title, item.url, item.sources, item.group))
+
     blocks: List[_Block] = []
     if alert:
         ordered = sorted(all_items, key=DigestItem.sort_key)
-        blocks.append(_Block(heading="", lines=[_item_line(i, show_group=True) for i in ordered]))
+        blocks.append(_Block(heading="", lines=[item_line(i, show_group=True) for i in ordered]))
     else:
         picked = sorted(all_items, key=DigestItem.sort_key)[:picks] if len(all_items) > picks + per_group else []
         picked_ids = {id(i) for i in picked}
         if picked:
-            blocks.append(_Block(heading="<b>⭐ 精选</b>", lines=[_item_line(i, show_group=True) for i in picked]))
+            blocks.append(_Block(heading="<b>⭐ 精选</b>", lines=[item_line(i, show_group=True) for i in picked]))
         for group, items in groups.items():
             rest = sorted((i for i in items if id(i) not in picked_ids), key=DigestItem.sort_key)
             if not rest:
                 continue
-            shown, folded = _fold_lines([_item_line(i) for i in rest], per_group, max_folded)
-            blocks.append(_Block(heading=f"<b>{_esc(group)}</b> · {len(rest)}", lines=shown, folded=folded))
+            shown, folded, hidden = _fold(rest, per_group, max_folded)
+            blocks.append(_Block(
+                heading=f"<b>{_esc(group)}</b> · {len(rest)}",
+                lines=[item_line(i) for i in shown],
+                folded=[item_line(i) for i in folded] + _hidden_line(hidden),
+            ))
 
     for name, items in standalone_sections:
-        shown, folded = _fold_lines([_standalone_line(i) for i in items], per_group, max_folded)
-        blocks.append(_Block(heading=f"<b>📌 {_esc(name)}</b> · {len(items)}", lines=shown, folded=folded))
+        shown, folded, hidden = _fold(items, per_group, max_folded)
+
+        def sa_line(data: Dict) -> str:
+            url = data.get("mobile_url") or data.get("url", "")
+            return _standalone_line(data, number(data.get("title", ""), url, [name], name))
+
+        blocks.append(_Block(
+            heading=f"<b>📌 {_esc(name)}</b> · {len(items)}",
+            lines=[sa_line(i) for i in shown],
+            folded=[sa_line(i) for i in folded] + _hidden_line(hidden),
+        ))
 
     if ai_content and not alert:
         blocks.append(_Block(heading="", raw="<blockquote expandable>" + ai_content.strip() + "</blockquote>"))
@@ -304,4 +372,7 @@ def build_telegram_digest(
             msg.replace(title_line, title_line[:-4] + f" · {i}/{total}</b>", 1)
             for i, msg in enumerate(messages, 1)
         ]
-    return messages
+    return [
+        DigestMessage(text=msg, items=[registry[int(n)] for n in _NUMBER_RE.findall(msg) if int(n) in registry])
+        for msg in messages
+    ]

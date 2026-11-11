@@ -848,6 +848,32 @@ class NewsAnalyzer:
                 reasons.append("去掉已推送")
             print(f"[推送] {'、'.join(reasons)}：热榜+RSS {before} → {after} 条")
 
+        # 事件归并：同一事件的多平台报道合并为一条，定时摘要时由 AI 归并（见 docs/design.md 第 6 节）
+        event_headlines: List[str] = []
+        merge_cfg = cfg.get("EVENT_MERGE", {})
+        if merge_cfg.get("ENABLED") and schedule and schedule.push and (stats or rss_items):
+            from trendradar.notification.events import merge_events
+
+            ai_chat, prompt = None, ("", "")
+            if merge_cfg.get("AI") and min_score is None:
+                from trendradar.ai.client import AIClient
+                from trendradar.ai.prompt_loader import load_prompt_template
+
+                prompt = load_prompt_template(merge_cfg.get("PROMPT_FILE", "ai_event_merge_prompt.txt"), label="事件归并")
+                ai_chat = AIClient(cfg.get("AI", {})).chat
+            recent = ledger.recent_headlines(self.ctx.get_time()) if ledger else []
+            merged = merge_events(stats, rss_items, recent_headlines=recent, ai_chat=ai_chat, prompt=prompt)
+            stats, rss_items = merged.stats, merged.rss_items
+            event_headlines = merged.headlines
+            print(
+                f"[事件归并] {'AI + 字面' if merged.ai_used else '字面'}：合并 {merged.merged} 条，"
+                f"移除已推送事件 {merged.seen_dropped} 条，剩 {len(merged.headlines)} 个事件"
+                + (f"（AI 分组校验拆出 {merged.ai_rejected} 条）" if merged.ai_rejected else "")
+            )
+            if cfg.get("DEBUG"):
+                for headline, members in merged.clusters:
+                    print(f"[事件归并][DEBUG] {headline} ← {' ; '.join(members)}")
+
         # 检查是否有有效内容（热榜或RSS）
         has_news_content = self._has_valid_content(stats, new_titles)
         has_rss_content = bool(rss_items and len(rss_items) > 0)
@@ -938,6 +964,8 @@ class NewsAnalyzer:
                 if ledger and ledger_entries:
                     ledger.record(ledger_entries, self.ctx.get_time())
                     print(f"[推送] 已记录 {len(ledger_entries)} 条已推送条目")
+                if ledger and event_headlines:
+                    ledger.record_headlines(event_headlines, self.ctx.get_time())
                 if schedule.once_push and schedule.period_key:
                     scheduler = self.ctx.create_scheduler()
                     date_str = self.ctx.format_date()
