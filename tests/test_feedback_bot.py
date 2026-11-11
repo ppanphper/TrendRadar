@@ -112,6 +112,30 @@ class BotTest(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], 60)
         self.assertEqual(bot.offset, 42)
 
+    def test_check_ready_registers_command_menu(self):
+        replies = {"getWebhookInfo": {"url": ""}, "getMe": {"username": "DSnow2Bot"}}
+        self.bot.api = lambda method, http_timeout=30, **payload: self.calls.append((method, payload)) or replies.get(method, True)
+        self.assertTrue(self.bot.check_ready())
+        method, payload = self.calls[-1]
+        self.assertEqual(method, "setMyCommands")
+        self.assertEqual(payload["scope"], {"type": "chat", "chat_id": -100})
+        self.assertEqual(payload["commands"][0]["command"], "interests")
+
+    def test_interests_command_replies_in_same_topic(self):
+        self.bot.username = "DSnow2Bot"
+        message = {"text": "/interests@DSnow2Bot", "chat": {"id": -100}, "from": {"id": 7}, "message_thread_id": 12}
+        self.bot.handle_update({"update_id": 2, "message": message})
+        methods = [m for m, _ in self.calls]
+        self.assertEqual(methods[0], "sendChatAction")
+        sent = [p for m, p in self.calls if m == "sendMessage"][0]
+        self.assertEqual(sent["message_thread_id"], 12)
+        self.assertIn("反馈", sent["text"])  # 反馈不足时回复原因
+
+        self.calls.clear()
+        self.bot.handle_update({"update_id": 3, "message": {**message, "text": "/interests@OtherBot"}})
+        self.bot.handle_update({"update_id": 4, "message": {**message, "text": "/interestsabc"}})
+        self.assertEqual(self.calls, [])
+
     def test_prompt_section_and_grid_cap(self):
         store = FeedbackStore(feedback_db_path(self.config["STORAGE"]["LOCAL"]["DATA_DIR"]))
         self.assertEqual(store.prompt_section(), "")

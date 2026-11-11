@@ -37,6 +37,11 @@ WEEKLY_WEEKDAY = 7       # 周日
 WEEKLY_HOUR = 21
 MIN_FEEDBACK_FOR_SUGGESTION = 3
 
+# 注册到 Telegram 的命令菜单：在群里输入 / 时弹出，可按文字筛选
+COMMANDS = [
+    {"command": "interests", "description": "根据近期 👍/👎 反馈生成兴趣调整建议"},
+]
+
 
 class TelegramError(Exception):
     def __init__(self, status: int, description: str):
@@ -61,6 +66,7 @@ class FeedbackBot:
         proxy = config.get("DEFAULT_PROXY") if config.get("USE_PROXY") else None
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
         self.offset: Optional[int] = None
+        self.username = ""
 
     # --- Telegram API ---
 
@@ -89,8 +95,19 @@ class FeedbackBot:
             print("[反馈bot] 该 bot 设置了 webhook，无法用 getUpdates 轮询；请确认这是独立 bot 后再删除 webhook")
             return False
         me = self.api("getMe")
-        print(f"[反馈bot] 已连接 @{me.get('username')}，监听 chat: {', '.join(sorted(self.chat_ids))}")
+        self.username = me.get("username") or ""
+        print(f"[反馈bot] 已连接 @{self.username}，监听 chat: {', '.join(sorted(self.chat_ids))}")
+        self.register_commands()
         return True
+
+    def register_commands(self) -> None:
+        """按群注册命令菜单；失败只记日志，不影响按钮处理"""
+        for chat in sorted(self.chat_ids):
+            chat_id = int(chat) if chat.lstrip("-").isdigit() else chat
+            try:
+                self.api("setMyCommands", commands=COMMANDS, scope={"type": "chat", "chat_id": chat_id})
+            except Exception as e:
+                print(f"[反馈bot] 注册命令菜单失败（chat {chat}）: {e}")
 
     def poll_once(self, timeout: int = POLL_TIMEOUT) -> int:
         payload = {"timeout": timeout, "allowed_updates": ["callback_query", "message"]}
@@ -206,10 +223,24 @@ class FeedbackBot:
         text = (message.get("text") or "").strip()
         chat_id = (message.get("chat") or {}).get("id")
         user_id = (message.get("from") or {}).get("id")
-        if not re.match(r"^/interests(@\w+)?\b", text) or not self._authorized(chat_id, user_id):
+        match = re.match(r"^/(\w+)(?:@(\w+))?(?:\s|$)", text)
+        if not match or not self._authorized(chat_id, user_id):
+            return
+        command, target = match.group(1).lower(), match.group(2)
+        # 群里有多个 bot 时，带 @ 的命令只处理发给自己的
+        if target and self.username and target.lower() != self.username.lower():
+            return
+        if command != "interests":
             return
         thread = message.get("message_thread_id")
-        result = self.create_suggestion(manual=True)
+        action = {"chat_id": chat_id, "action": "typing"}
+        if thread:
+            action["message_thread_id"] = thread
+        try:
+            self.api("sendChatAction", **action)
+        except Exception:
+            pass
+        result = self.create_suggestion(manual=True, chat_id=chat_id, thread_id=thread)
         if isinstance(result, str):
             self.send(result, chat_id=chat_id, thread_id=thread)
 
@@ -236,7 +267,7 @@ class FeedbackBot:
             return
         self.create_suggestion(manual=False)
 
-    def create_suggestion(self, manual: bool):
+    def create_suggestion(self, manual: bool, chat_id=None, thread_id=None):
         """生成建议并发到话题；返回建议 ID，或说明未生成原因的字符串"""
         now = self.now()
         since = self.store.last_suggestion_at()
@@ -273,7 +304,7 @@ class FeedbackBot:
             f"{html.escape(summary)}\n\n"
             "<blockquote expandable>" + html.escape("\n".join(diff) or "（仅格式调整）") + "</blockquote>"
         )
-        self.send(text, reply_markup=suggestion_keyboard(sid))
+        self.send(text, chat_id=chat_id, thread_id=thread_id, reply_markup=suggestion_keyboard(sid))
         return sid
 
     def _ask_ai(self, current: str, liked: List[Dict], disliked: List[Dict]) -> Dict:
