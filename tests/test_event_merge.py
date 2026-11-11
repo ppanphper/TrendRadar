@@ -38,6 +38,16 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(result.merged, 1)
         self.assertEqual(len(result.headlines), 2)
 
+    def test_lexical_cluster_prefers_statement_title(self):
+        stats = _stats(("消费", [
+            _t("京东内测独立短剧产品：打法和红果有什么区别？", "澎湃", 0.9),
+            _t("刘强东也要入局短剧？京东内测独立短剧产品：打法和红果有什么区别？", "财联社", 0.8),
+        ]))
+        result = merge_events(stats, None)
+        self.assertEqual(result.stats[0]["titles"][0]["event_headline"], "京东内测独立短剧产品")
+        stats = _stats(("消费", [_t("如何评价拼多多送货上门新规？", "知乎", 0.9), _t("拼多多送货上门新规生效", "百度", 0.8)]))
+        self.assertEqual(merge_events(stats, None).stats[0]["titles"][0]["event_headline"], "拼多多送货上门新规生效")
+
     def test_recent_headline_removes_repeat(self):
         stats = _stats(("科技", [_t("阿里宣布平头哥赴港上市", "百度"), _t("苹果发布新品", "知乎")]))
         result = merge_events(stats, None, recent_headlines=["阿里宣布平头哥赴港独立上市"])

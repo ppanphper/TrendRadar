@@ -63,6 +63,22 @@ def lexically_similar(a: str, b: str) -> bool:
     return _similar_sig(_sig(a), _sig(b))
 
 
+_QUESTION = re.compile(r"([?？]\s*$)|如何评价|怎么看|是什么|有哪些|为什么|吗$")
+
+
+def _statement_title(titles: List[str]) -> str:
+    """字面归并的组没有 AI 标题：按相关度顺序取第一条陈述句；都是问句时取问句前的陈述部分"""
+    for title in titles:
+        if not _QUESTION.search(title):
+            return title
+    for title in titles:
+        parts = [p.strip() for p in re.split(r"[：:？?，,]", title) if p.strip()]
+        statements = [p for p in parts if not _QUESTION.search(p) and len(p) >= 6]
+        if statements:
+            return statements[0]
+    return titles[0]
+
+
 @dataclass
 class _Candidate:
     kind: str            # "hot" / "rss"
@@ -266,7 +282,7 @@ def merge_events(
                 if source and source not in sources:
                     sources.append(source)
             keep.data = dict(keep.data)
-            keep.data["event_headline"] = headlines.get(root) or keep.title
+            keep.data["event_headline"] = headlines.get(root) or _statement_title([candidates[m].title for m in members])
             keep.data["event_sources"] = sources
             keep.data["event_size"] = len(members)
             drop.update(members[1:])
