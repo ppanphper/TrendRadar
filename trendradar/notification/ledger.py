@@ -34,9 +34,28 @@ class PushLedger:
                 "CREATE TABLE IF NOT EXISTS pushed ("
                 " key TEXT PRIMARY KEY, title TEXT, pushed_at TEXT NOT NULL)"
             )
+            # 已推送的事件标题，用于跨次识别换了说法的同一事件
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS events ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, headline TEXT NOT NULL, pushed_at TEXT NOT NULL)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        return sqlite3.connect(self.db_path, timeout=10)
+
+    def recent_headlines(self, now: datetime, days: int = 2, limit: int = 200) -> List[str]:
+        cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT headline FROM events WHERE pushed_at >= ? ORDER BY id DESC LIMIT ?", (cutoff, limit)
+            ).fetchall()
+        return [row[0] for row in reversed(rows)]
+
+    def record_headlines(self, headlines: Iterable[str], now: datetime) -> None:
+        stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        rows = [(h, stamp) for h in dict.fromkeys(h for h in headlines if h)]
+        with self._connect() as conn:
+            conn.executemany("INSERT INTO events (headline, pushed_at) VALUES (?, ?)", rows)
 
     def pushed_keys(self, keys: Iterable[str]) -> Set[str]:
         keys = list(set(keys))
@@ -60,6 +79,7 @@ class PushLedger:
                 [(key, title, stamp) for key, title in entries.items()],
             )
             conn.execute("DELETE FROM pushed WHERE pushed_at < ?", (cutoff,))
+            conn.execute("DELETE FROM events WHERE pushed_at < ?", (cutoff,))
 
 
 def _filter_stats(

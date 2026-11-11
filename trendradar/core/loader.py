@@ -91,6 +91,7 @@ def _load_notification_config(config_data: Dict) -> Dict:
 
     max_accounts_env = _get_env_int_or_none("MAX_ACCOUNTS_PER_CHANNEL")
     dedupe = notification.get("dedupe", {}) or {}
+    event_merge = notification.get("event_merge", {}) or {}
 
     return {
         "ENABLE_NOTIFICATION": notification.get("enabled", True),
@@ -98,6 +99,12 @@ def _load_notification_config(config_data: Dict) -> Dict:
         "PUSH_DEDUPE": {
             "ENABLED": bool(dedupe.get("enabled", False)),
             "RETENTION_DAYS": dedupe.get("retention_days", 7),
+        },
+        # 事件归并：字面归并 + 定时摘要时的 AI 归并，见 docs/design.md 第 6 节
+        "EVENT_MERGE": {
+            "ENABLED": bool(event_merge.get("enabled", False)),
+            "AI": bool(event_merge.get("ai", True)),
+            "PROMPT_FILE": event_merge.get("prompt_file", "ai_event_merge_prompt.txt"),
         },
         "MESSAGE_BATCH_SIZE": batch_size.get("default", 4000),
         "DINGTALK_BATCH_SIZE": batch_size.get("dingtalk", 20000),
