@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from .archive import archive_items
 from .parser import RSSParser
 from trendradar.storage.base import RSSItem, RSSData
 from trendradar.utils.time import get_configured_time, is_within_days, DEFAULT_TIMEZONE
@@ -51,6 +52,7 @@ class RSSFeedConfig:
     max_age_days: Optional[int] = None  # 文章最大年龄（天），覆盖全局设置；None=使用全局，0=禁用过滤
     use_proxy: Optional[bool] = None    # 是否走代理，覆盖全局 advanced.rss.use_proxy；None=使用全局
     impersonate: str = ""               # 模拟浏览器 TLS 指纹（如 "chrome"），用于 Cloudflare 拦截 Python 客户端的站点；需要 curl_cffi
+    archive: bool = False               # 是否把条目全文存为本地快照（<data_dir>/archive）
 
 
 def feed_config_from_dict(feed_config: Dict, default_max_items: int = 0) -> RSSFeedConfig:
@@ -83,6 +85,7 @@ def feed_config_from_dict(feed_config: Dict, default_max_items: int = 0) -> RSSF
         max_age_days=max_age_days,  # None=使用全局，0=禁用，>0=覆盖
         use_proxy=use_proxy,
         impersonate=str(feed_config.get("impersonate") or "").strip(),
+        archive=feed_config.get("archive") is True,
     )
 
 
@@ -103,6 +106,7 @@ class RSSFetcher:
         timezone: str = DEFAULT_TIMEZONE,
         freshness_enabled: bool = True,
         default_max_age_days: int = 3,
+        archive_dir: Optional[str] = None,
     ):
         """
         初始化抓取器
@@ -116,6 +120,7 @@ class RSSFetcher:
             timezone: 时区配置（如 'Asia/Shanghai'）
             freshness_enabled: 是否启用新鲜度过滤
             default_max_age_days: 默认最大文章年龄（天）
+            archive_dir: 快照目录（源配置 archive: true 时写入）
         """
         self.feeds = [f for f in feeds if f.enabled]
         self.request_interval = request_interval
@@ -125,6 +130,7 @@ class RSSFetcher:
         self.timezone = timezone
         self.freshness_enabled = freshness_enabled
         self.default_max_age_days = default_max_age_days
+        self.archive_dir = archive_dir
 
         self.parser = RSSParser()
         self.session = self._create_session()
@@ -165,6 +171,25 @@ class RSSFetcher:
                 raise RuntimeError("impersonate 需要安装 curl_cffi") from e
             self._impersonate_session = curl_requests.Session()
         return self._impersonate_session
+
+    def _fetch_bytes(self, feed: RSSFeedConfig, url: str) -> Optional[bytes]:
+        """下载快照里的图片，沿用该源的代理设置；失败返回 None"""
+        kwargs = {"timeout": self.timeout, "stream": True}
+        proxies = self._feed_proxies(feed)
+        if proxies is not None:
+            kwargs["proxies"] = proxies
+        try:
+            with self.session.get(url, **kwargs) as response:
+                if response.status_code != 200 or not response.headers.get("Content-Type", "").startswith("image/"):
+                    return None
+                data = b""
+                for chunk in response.iter_content(64 * 1024):
+                    data += chunk
+                    if len(data) > 5 * 1024 * 1024:
+                        return None
+                return data
+        except requests.RequestException:
+            return None
 
     def _request(self, feed: RSSFeedConfig):
         """发起请求并返回响应；HTTP 错误统一抛出 requests.HTTPError 以复用重试判断"""
@@ -241,6 +266,7 @@ class RSSFetcher:
 
             # 转换为 RSSItem（使用配置的时区）
             now = get_configured_time(self.timezone)
+            archive_items(self.archive_dir, feed, parsed_items, now, fetch_bytes=lambda u: self._fetch_bytes(feed, u))
             crawl_time = now.strftime("%H:%M")
             items = []
 

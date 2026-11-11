@@ -1085,6 +1085,7 @@ class NewsAnalyzer:
                 timezone=timezone,
                 freshness_enabled=freshness_enabled,
                 default_max_age_days=default_max_age_days,
+                archive_dir=str(Path(self.ctx.config.get("STORAGE", {}).get("LOCAL", {}).get("DATA_DIR", "output")) / "archive"),
             )
 
             # 抓取数据

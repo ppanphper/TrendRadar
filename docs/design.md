@@ -64,7 +64,7 @@
 ## 5. RSS 快照
 
 - 源配置 `archive: true` 时，抓取后把条目全文（RSS 的 description/content，未截断的 HTML）存为 `output/archive/<feed_id>/<YYYY-MM>/<guid 摘要>.html`，同一条目只保存首次抓到的版本。
-- 页面包含标题、作者、发布时间、原文链接和抓取时间；图片保留远程地址（linux.do 图片在 CDN 上）。
+- 页面包含标题、作者、发布时间（换算为配置时区）、原文链接和抓取时间；正文图片下载到同名 `_files/` 目录并改写为相对路径（每篇最多 20 张、单张不超过 5 MB），下载失败的保留远程地址；去掉 srcset、脚本、内嵌框架和事件属性。
 - `output/archive/index.html` 按时间倒序列出快照，可通过 `http://localhost:8089/archive/` 浏览。
 - Discourse 的 RSS description 含首帖完整 HTML（不含回复），因此 linux.do 无需再请求帖子页面，也就不受 Cloudflare 质询影响。
 

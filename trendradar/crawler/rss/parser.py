@@ -30,6 +30,7 @@ class ParsedRSSItem:
     summary: Optional[str] = None
     author: Optional[str] = None
     guid: Optional[str] = None
+    content_html: Optional[str] = None  # 未截断的原始正文 HTML（用于快照，不入库）
 
 
 class RSSParser:
@@ -175,6 +176,7 @@ class RSSParser:
             summary=summary or None,
             author=author,
             guid=guid,
+            content_html=item_data.get("content_html") or item_data.get("content_text") or None,
         )
 
     def _parse_iso_date(self, date_str: str) -> Optional[str]:
@@ -255,7 +257,18 @@ class RSSParser:
             summary=summary,
             author=author,
             guid=guid,
+            content_html=self._raw_content(entry),
         )
+
+    @staticmethod
+    def _raw_content(entry: Any) -> Optional[str]:
+        """取最完整的原始正文：content 优先，其次 description/summary"""
+        content = entry.get("content", [])
+        if content and isinstance(content, list):
+            value = content[0].get("value", "")
+            if value:
+                return value
+        return entry.get("description") or entry.get("summary") or None
 
     def _clean_text(self, text: str) -> str:
         """清理文本"""
