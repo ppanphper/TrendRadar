@@ -1,12 +1,17 @@
-"""推送反馈：消息映射、编号网格、正文勾选与批量提交、反馈切换、权限、兴趣建议的生成与应用、分类提示附带反馈。"""
+"""推送反馈：消息映射、编号网格、正文勾选与批量提交、反馈切换、权限、后台应答、兴趣建议的生成与应用、分类提示附带反馈。"""
 
+import io
 import os
 import tempfile
+import threading
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
+
+import requests
 
 from trendradar.bot import FeedbackBot
 from trendradar.notification.feedback import FeedbackStore, feedback_db_path, grid_keyboard
@@ -16,6 +21,29 @@ ITEMS = [
     {"n": 1, "title": "大模型发布", "url": "https://a", "source": "知乎", "group": "大模型"},
     {"n": 2, "title": "明星八卦", "url": "https://b", "source": "微博", "group": "文化"},
 ]
+
+
+class InlineExecutor:
+    """测试用：回调应答当场执行，断言不必等后台线程"""
+
+    def submit(self, fn, *args):
+        fn(*args)
+
+    def shutdown(self, wait=True):
+        pass
+
+
+def reply(result):
+    response = MagicMock()
+    response.json.return_value = {"ok": True, "result": result}
+    return response
+
+
+def callback_update(update_id, data, message_id=20):
+    return {"update_id": update_id, "callback_query": {
+        "id": f"cb{update_id}", "from": {"id": 7}, "data": data,
+        "message": {"message_id": message_id, "chat": {"id": -100}},
+    }}
 
 
 class BotTest(unittest.TestCase):
@@ -30,6 +58,7 @@ class BotTest(unittest.TestCase):
             "AI_FILTER": {"INTERESTS_PATH": str(self.config_dir / "ai_interests.txt")},
         }
         self.bot = FeedbackBot(self.config)
+        self.bot.answers = InlineExecutor()
         self.calls = []
         self.bot.api = lambda method, http_timeout=30, **payload: self.calls.append((method, payload)) or {}
         self.bot.now = lambda: NOW
@@ -93,6 +122,66 @@ class BotTest(unittest.TestCase):
         self._callback("fb:ok", message_id=20)
         self.assertEqual([f["title"] for f in self.bot.store.recent("like")], ["明星八卦"])
         self.assertEqual(self.bot.store.recent("dislike"), [])
+
+    def _polling_bot(self, updates, answer):
+        """真实的 api()：轮询和重绘走 main，回调应答由 answer 处理"""
+        self.bot.store.save_message("-100", 20, ITEMS, NOW, text="<b>📰 摘要</b>\n<code>1</code> 大模型发布")
+        posted = []
+        main = MagicMock()
+        main.post.side_effect = lambda url, **kw: posted.append(url.rsplit("/", 1)[1]) or reply(
+            updates if url.endswith("getUpdates") else True)
+        worker = MagicMock()
+        worker.post.side_effect = lambda url, **kw: answer(kw["json"]) or reply(True)
+        bot = FeedbackBot(self.config, session=main)
+        bot.now = lambda: NOW
+        # 后台线程启动时新建的 Session 换成 worker
+        patcher = patch("trendradar.bot.requests.Session", return_value=worker)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(lambda: bot.answers.shutdown())
+        return bot, posted
+
+    def test_answer_in_background_does_not_delay_redraw(self):
+        released, answered = threading.Event(), []
+
+        def slow_answer(payload):
+            released.wait(5)
+            answered.append(payload["callback_query_id"])
+
+        bot, posted = self._polling_bot([callback_update(5, "fb:d")], slow_answer)
+        self.assertEqual(bot.poll_once(timeout=0), 1)
+        # 应答还卡着，重绘已经发出；应答不占用轮询的 Session
+        self.assertEqual(posted, ["getUpdates", "editMessageText"])
+        self.assertEqual(answered, [])
+        released.set()
+        bot.answers.shutdown(wait=True)
+        self.assertEqual(answered, ["cb5"])
+
+    def test_batch_answers_are_sent_concurrently(self):
+        barrier, answered = threading.Barrier(3, timeout=2), []
+
+        def answer(payload):
+            barrier.wait()  # 串行应答时等不齐三个，超时报错
+            answered.append(payload["callback_query_id"])
+
+        updates = [callback_update(5, "fb:d"), callback_update(6, "fv:d:1"), callback_update(7, "fv:d:2")]
+        bot, posted = self._polling_bot(updates, answer)
+        bot.poll_once(timeout=0)
+        bot.answers.shutdown(wait=True)
+        self.assertEqual(sorted(answered), ["cb5", "cb6", "cb7"])
+        self.assertEqual(posted.count("editMessageText"), 1)
+
+    def test_answer_failure_is_logged_without_blocking_redraw(self):
+        def fail(payload):
+            raise requests.ConnectionError("proxy down")
+
+        bot, posted = self._polling_bot([callback_update(5, "fb:d")], fail)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            bot.poll_once(timeout=0)
+            bot.answers.shutdown(wait=True)
+        self.assertIn("editMessageText", posted)
+        self.assertIn("应答回调失败", out.getvalue())
 
     def test_grid_and_toggle(self):
         calls = self._callback("fb:d")
