@@ -14,7 +14,9 @@ import html
 import json
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -38,6 +40,7 @@ POLL_TIMEOUT = 50
 WEEKLY_WEEKDAY = 7       # 周日
 WEEKLY_HOUR = 21
 MIN_FEEDBACK_FOR_SUGGESTION = 3
+ANSWER_WORKERS = 4       # 同时发出的回调应答数
 
 # 注册到 Telegram 的命令菜单：在群里输入 / 时弹出，可按文字筛选
 COMMANDS = [
@@ -73,12 +76,19 @@ class FeedbackBot:
         self.drafts: Dict[Tuple[str, int], Tuple[str, Set[int]]] = {}
         # 待重绘的 Rich Message；一批更新处理完再统一重绘，连续勾选只编辑一次
         self.dirty: Set[Tuple[str, int]] = set()
+        # 回调应答在后台线程发出，重绘不用等它返回；requests.Session 不保证线程安全，后台线程各用自己的
+        self._local = threading.local()
+        self.answers = ThreadPoolExecutor(ANSWER_WORKERS, thread_name_prefix="answer", initializer=self._init_worker)
 
     # --- Telegram API ---
 
+    def _init_worker(self) -> None:
+        self._local.session = requests.Session()
+
     def api(self, method: str, http_timeout: int = 30, **payload):
         # http_timeout 是本地请求超时；payload 里的 timeout 是 getUpdates 长轮询的服务端等待时间
-        response = self.session.post(
+        session = getattr(self._local, "session", None) or self.session
+        response = session.post(
             f"https://api.telegram.org/bot{self.token}/{method}",
             json=payload, proxies=self.proxies, timeout=http_timeout,
         )
@@ -89,6 +99,16 @@ class FeedbackBot:
         if not data.get("ok"):
             raise TelegramError(response.status_code, data.get("description", ""))
         return data.get("result")
+
+    def answer_callback(self, callback_id: str, text: str = "") -> None:
+        """后台应答回调：停掉按钮上的加载状态、弹出提示"""
+        self.answers.submit(self._answer_callback, callback_id, text[:200])
+
+    def _answer_callback(self, callback_id: str, text: str) -> None:
+        try:
+            self.api("answerCallbackQuery", callback_query_id=callback_id, text=text)
+        except Exception as e:
+            print(f"[反馈bot] 应答回调失败: {type(e).__name__}: {e}")
 
     def now(self) -> datetime:
         return get_configured_time(self.timezone)
@@ -207,11 +227,11 @@ class FeedbackBot:
         user_id = (cq.get("from") or {}).get("id")
         data = cq.get("data") or ""
         if not self._authorized(chat_id, user_id):
-            self.api("answerCallbackQuery", callback_query_id=cq["id"], text="没有权限")
+            self.answer_callback(cq["id"], "没有权限")
             return
 
         def answer(text: str = ""):
-            self.api("answerCallbackQuery", callback_query_id=cq["id"], text=text[:200])
+            self.answer_callback(cq["id"], text)
 
         def set_markup(markup: Dict):
             try:
