@@ -11,7 +11,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # Telegram 正文上限 4096 字符（去掉标签、还原实体后按 UTF-16 计），留出余量
 TELEGRAM_TEXT_LIMIT = 3800
@@ -156,6 +156,45 @@ def _standalone_line(data: Dict, n: Optional[int] = None) -> str:
 
 
 _NUMBER_RE = re.compile(r"(?:^|\n|<blockquote expandable>)<code>(\d+)</code> ")
+_QUOTE_RE = re.compile(r"<blockquote expandable>(.*?)</blockquote>", re.S)
+_LINE_NUMBER_RE = re.compile(r"^<code>(\d+)</code> ")
+
+
+def to_rich_html(text: str, picking: Optional[str] = None, selected: Optional[Set[int]] = None) -> str:
+    """把摘要消息（Telegram HTML，\\n 换行）转成 Rich Message 的 HTML
+
+    picking 为反馈代码（l / d）时进入勾选状态：每条编号前加勾选按钮，已勾选的显示 ✅；
+    折叠引用块改为展开，免得每次重绘后都要重新展开。
+    """
+    selected = selected or set()
+
+    def line(raw: str) -> str:
+        m = _LINE_NUMBER_RE.match(raw)
+        if not picking or not m:
+            return raw
+        n = int(m.group(1))
+        mark = "✅" if n in selected else "☐"
+        return f'<tg-button type="callback_data" data="fv:{picking}:{n}">{mark}</tg-button> {raw}'
+
+    def paragraphs(segment: str) -> List[str]:
+        out, cur = [], []
+        for raw in segment.split("\n") + [""]:
+            if raw.strip():
+                cur.append(line(raw))
+            elif cur:
+                out.append("<p>" + "<br/>".join(cur) + "</p>")
+                cur = []
+        return out
+
+    parts: List[str] = []
+    pos = 0
+    for m in _QUOTE_RE.finditer(text):
+        parts.extend(paragraphs(text[pos:m.start()]))
+        tag = "<blockquote>" if picking else "<blockquote expandable>"
+        parts.append(tag + "<br/>".join(line(raw) for raw in m.group(1).strip("\n").split("\n")) + "</blockquote>")
+        pos = m.end()
+    parts.extend(paragraphs(text[pos:]))
+    return "".join(parts)
 
 
 @dataclass

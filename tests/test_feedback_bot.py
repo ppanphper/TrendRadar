@@ -1,4 +1,4 @@
-"""推送反馈：消息映射、编号网格、反馈切换、权限、兴趣建议的生成与应用、分类提示附带反馈。"""
+"""推送反馈：消息映射、编号网格、正文勾选与批量提交、反馈切换、权限、兴趣建议的生成与应用、分类提示附带反馈。"""
 
 import os
 import tempfile
@@ -38,13 +38,61 @@ class BotTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _callback(self, data, chat="-100", user=7):
+    def _callback(self, data, chat="-100", user=7, message_id=10):
         self.calls.clear()
         self.bot.handle_update({"update_id": 1, "callback_query": {
             "id": "cb", "from": {"id": user}, "data": data,
-            "message": {"message_id": 10, "chat": {"id": int(chat)}},
+            "message": {"message_id": message_id, "chat": {"id": int(chat)}},
         }})
         return dict(self.calls)
+
+    def test_rich_message_picking_and_batch_submit(self):
+        text = "<b>📰 摘要</b>\n\n<b>大模型</b> · 2\n<code>1</code> 大模型发布\n<code>2</code> 明星八卦"
+        self.bot.store.save_message("-100", 20, ITEMS, NOW, text=text)
+
+        calls = self._callback("fb:d", message_id=20)
+        self.assertEqual(calls["answerCallbackQuery"]["text"], "")
+        self.assertNotIn("editMessageText", calls)  # 重绘留到这批更新处理完
+        self.bot.flush_redraws()
+        edit = dict(self.calls)["editMessageText"]
+        self.assertEqual(edit["chat_id"], -100)
+        self.assertIn('data="fv:d:1">☐</tg-button>', edit["rich_message"]["html"])
+        self.assertEqual([b["callback_data"] for b in edit["reply_markup"]["inline_keyboard"][0]], ["fb:back", "fb:ok"])
+
+        # 连续勾选：不弹提示、不写库，只编辑一次
+        self._callback("fv:d:1", message_id=20)
+        calls = self._callback("fv:d:2", message_id=20)
+        self.assertEqual(calls["answerCallbackQuery"]["text"], "")
+        self.assertEqual(self.bot.store.recent("dislike"), [])
+        self.calls.clear()
+        self.bot.flush_redraws()
+        self.assertEqual([m for m, _ in self.calls], ["editMessageText"])
+        edit = self.calls[0][1]
+        self.assertIn('data="fv:d:2">✅</tg-button>', edit["rich_message"]["html"])
+        self.assertEqual(edit["reply_markup"]["inline_keyboard"][0][1]["text"], "提交 👎 2 条")
+
+        # 再点一次取消勾选，提交后写入并在按钮上显示条数
+        self._callback("fv:d:1", message_id=20)
+        calls = self._callback("fb:ok", message_id=20)
+        self.assertEqual(calls["answerCallbackQuery"]["text"], "已记录 1 条不感兴趣")
+        self.assertEqual([f["title"] for f in self.bot.store.recent("dislike")], ["明星八卦"])
+        self.calls.clear()
+        self.bot.flush_redraws()
+        edit = self.calls[0][1]
+        self.assertNotIn("tg-button", edit["rich_message"]["html"])
+        row = edit["reply_markup"]["inline_keyboard"][0]
+        self.assertEqual((row[0]["text"], row[0].get("style")), ("👍 感兴趣", None))
+        self.assertEqual((row[1]["text"], row[1]["style"]), ("👎 不感兴趣 · 1", "danger"))
+
+        # 改标感兴趣会去掉不感兴趣；取消则丢弃草稿
+        self._callback("fb:l", message_id=20)
+        self._callback("fv:l:2", message_id=20)
+        self._callback("fb:back", message_id=20)
+        self.assertEqual(self.bot.store.recent("like"), [])
+        self._callback("fv:l:2", message_id=20)  # 没进勾选状态（如 bot 重启）也能接着勾
+        self._callback("fb:ok", message_id=20)
+        self.assertEqual([f["title"] for f in self.bot.store.recent("like")], ["明星八卦"])
+        self.assertEqual(self.bot.store.recent("dislike"), [])
 
     def test_grid_and_toggle(self):
         calls = self._callback("fb:d")
@@ -54,6 +102,7 @@ class BotTest(unittest.TestCase):
 
         calls = self._callback("fv:d:2")
         self.assertIn("明星八卦", calls["answerCallbackQuery"]["text"])
+        self.assertNotIn("editMessageText", calls)
         self.assertEqual(calls["editMessageReplyMarkup"]["reply_markup"]["inline_keyboard"][0][1]["text"], "2✓")
         self.assertEqual([f["title"] for f in self.bot.store.recent("dislike")], ["明星八卦"])
 
@@ -63,6 +112,11 @@ class BotTest(unittest.TestCase):
         calls = self._callback("fv:l:2")
         self.assertTrue(calls["answerCallbackQuery"]["text"].startswith("已取消"))
         self.assertEqual(self.bot.store.recent("like"), [])
+
+        # 返回时按钮显示已标记的条数
+        self._callback("fv:d:1")
+        calls = self._callback("fb:back")
+        self.assertEqual(calls["editMessageReplyMarkup"]["reply_markup"]["inline_keyboard"][0][1]["text"], "👎 不感兴趣 · 1")
 
     def test_unauthorized_chat_or_user(self):
         calls = self._callback("fv:d:1", chat="-999")

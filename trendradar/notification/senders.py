@@ -470,17 +470,39 @@ def send_to_wework(
     return True
 
 
-def _save_feedback_mapping(feedback_db: str, chat_id: str, result: Dict, items: List[Dict], get_time_func) -> None:
-    """记录消息与条目的映射，供反馈按钮回调查找；失败不影响推送"""
+def _save_feedback_mapping(
+    feedback_db: str, chat_id: str, result: Dict, items: List[Dict], get_time_func, text: Optional[str] = None
+) -> None:
+    """记录消息与条目的映射，供反馈按钮回调查找；text 是 Rich Message 的摘要原文。失败不影响推送"""
     try:
         from trendradar.notification.feedback import FeedbackStore
 
         message_id = (result.get("result") or {}).get("message_id")
         if message_id:
             now = get_time_func() if get_time_func else datetime.now()
-            FeedbackStore(feedback_db).save_message(chat_id, message_id, items, now)
+            FeedbackStore(feedback_db).save_message(chat_id, message_id, items, now, text=text)
     except Exception as e:
         print(f"[反馈] 保存消息映射失败: {e}")
+
+
+def _send_telegram_rich(bot_token: str, payload: Dict, text: str, proxies, log_prefix: str) -> Optional[Dict]:
+    """以 Rich Message 发送摘要（条目行内可放勾选按钮）；Telegram 拒绝时返回 None，由调用方改发普通消息。
+    网络异常照常抛出：超时时消息可能已发出，改发会重复"""
+    from trendradar.notification.telegram_digest import to_rich_html
+
+    rich_payload = {k: v for k, v in payload.items() if k not in ("text", "parse_mode", "disable_web_page_preview")}
+    rich_payload["rich_message"] = {"html": to_rich_html(text)}
+    response = requests.post(
+        f"https://api.telegram.org/bot{bot_token}/sendRichMessage", json=rich_payload, proxies=proxies, timeout=30
+    )
+    try:
+        result = response.json()
+    except ValueError:
+        result = {}
+    if response.status_code == 200 and result.get("ok"):
+        return result
+    print(f"{log_prefix} Rich Message 发送失败，改发普通消息：{response.text[:200]}")
+    return None
 
 
 def send_to_telegram(
@@ -584,6 +606,9 @@ def send_to_telegram(
 
     print(f"{log_prefix}消息分为 {len(batches)} 批次发送 [{report_type}]")
 
+    # 带反馈按钮的摘要优先用 Rich Message；一旦失败，本轮剩余批次都发普通消息
+    rich = True
+
     # 逐批发送
     for i, batch_content in enumerate(batches, 1):
         content_size = len(batch_content.encode("utf-8"))
@@ -606,6 +631,19 @@ def send_to_telegram(
             from trendradar.notification.feedback import base_keyboard
 
             payload["reply_markup"] = base_keyboard()
+            if rich:
+                try:
+                    result = _send_telegram_rich(bot_token, payload, batch_content, proxies, log_prefix)
+                except Exception as e:
+                    print(f"{log_prefix}第 {i}/{len(batches)} 批次发送出错 [{report_type}]：{e}")
+                    return False
+                if result:
+                    print(f"{log_prefix}第 {i}/{len(batches)} 批次发送成功（Rich Message）[{report_type}]")
+                    _save_feedback_mapping(feedback_db, chat_id, result, items, get_time_func, text=batch_content)
+                    if i < len(batches):
+                        time.sleep(batch_interval)
+                    continue
+                rich = False
 
         try:
             response = requests.post(
