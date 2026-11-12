@@ -8,6 +8,7 @@ from trendradar.notification.telegram_digest import (
     build_telegram_digest,
     build_telegram_digest_messages,
     to_plain_text,
+    to_rich_html,
     visible_length,
 )
 
@@ -22,6 +23,39 @@ def _title(title, source="知乎", rank=5, score=0.8, url="https://example.com/a
 
 def _report(groups):
     return {"stats": [{"word": word, "count": len(items), "titles": items} for word, items in groups]}
+
+
+class RichHtmlTest(unittest.TestCase):
+    TEXT = (
+        "<b>📰 摘要 · 11-11 18:00</b>\n热榜 4\n\n"
+        "<b>大模型</b> · 3\n<code>1</code> <a href=\"https://a\">A</a> <i>知乎</i>\n<code>2</code> B\n"
+        "<blockquote expandable><code>3</code> C\n<i>…另有 2 条，见网页报告</i></blockquote>\n\n"
+        "<blockquote expandable><b>✨ AI 热点分析</b>\n\n<b>核心</b>\n1. x</blockquote>"
+    )
+
+    def test_paragraphs_and_folded_quotes(self):
+        html = to_rich_html(self.TEXT)
+        self.assertTrue(html.startswith("<p><b>📰 摘要 · 11-11 18:00</b><br/>热榜 4</p><p><b>大模型</b> · 3<br/><code>1</code> "))
+        self.assertIn("<blockquote expandable><code>3</code> C<br/><i>…另有 2 条，见网页报告</i></blockquote>", html)
+        # AI 分析里的空行留在引用块内，不把引用块拆开
+        self.assertIn("<blockquote expandable><b>✨ AI 热点分析</b><br/><br/><b>核心</b><br/>1. x</blockquote>", html)
+        self.assertNotIn("tg-button", html)
+        self.assertNotIn("\n", html)
+
+    def test_picking_adds_buttons_and_unfolds(self):
+        html = to_rich_html(self.TEXT, "d", {2})
+        self.assertIn('<tg-button type="callback_data" data="fv:d:1">☐</tg-button> <code>1</code> ', html)
+        self.assertIn('<tg-button type="callback_data" data="fv:d:2">✅</tg-button> <code>2</code> B', html)
+        self.assertIn('<blockquote><tg-button type="callback_data" data="fv:d:3">☐</tg-button> <code>3</code> C', html)
+        self.assertNotIn("expandable", html)
+        self.assertEqual(html.count("<tg-button"), 3)
+
+    def test_real_digest_round_trip(self):
+        items = [_title(f"新闻{i}") for i in range(8)]
+        msg = build_telegram_digest_messages(_report([("大模型", items)]), now=NOW)[0]
+        html = to_rich_html(msg.text, "l")
+        self.assertEqual(html.count("<tg-button"), len(msg.items))
+        self.assertIn("&amp;y=2", html)
 
 
 class VisibleLengthTest(unittest.TestCase):

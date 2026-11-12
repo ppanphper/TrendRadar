@@ -2,7 +2,7 @@
 """
 推送反馈 bot：长轮询接收 Telegram 按钮回调
 
-- 👍 / 👎 按钮：展开本条消息的编号网格，点编号记录反馈，再点取消
+- 👍 / 👎 按钮：Rich Message 摘要在正文每条前显示勾选按钮，勾完一次提交；普通消息展开编号网格，点编号即记录
 - 每周日 21:00 后或收到 /interests：根据反馈生成兴趣描述修改建议，点「应用」写入 ai_filter.interests_path
 
 运行：python -m trendradar.bot（需要独立 bot：同一 bot 只能有一个轮询方，且不能设置 webhook）
@@ -17,7 +17,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -28,8 +28,10 @@ from trendradar.notification.feedback import (
     base_keyboard,
     feedback_db_path,
     grid_keyboard,
+    picking_keyboard,
     suggestion_keyboard,
 )
+from trendradar.notification.telegram_digest import to_rich_html
 from trendradar.utils.time import DEFAULT_TIMEZONE, get_configured_time
 
 POLL_TIMEOUT = 50
@@ -67,6 +69,10 @@ class FeedbackBot:
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
         self.offset: Optional[int] = None
         self.username = ""
+        # 正文勾选的草稿：(chat_id, message_id) -> (反馈代码, 已勾选编号)；提交前只存在内存里
+        self.drafts: Dict[Tuple[str, int], Tuple[str, Set[int]]] = {}
+        # 待重绘的 Rich Message；一批更新处理完再统一重绘，连续勾选只编辑一次
+        self.dirty: Set[Tuple[str, int]] = set()
 
     # --- Telegram API ---
 
@@ -120,7 +126,38 @@ class FeedbackBot:
                 self.handle_update(update)
             except Exception as e:
                 print(f"[反馈bot] 处理更新 {update.get('update_id')} 失败: {type(e).__name__}: {e}")
+        self.flush_redraws()
         return len(updates)
+
+    def flush_redraws(self) -> None:
+        while self.dirty:
+            chat_id, message_id = self.dirty.pop()
+            try:
+                self.redraw(chat_id, message_id)
+            except TelegramError as e:
+                retry = re.search(r"retry after (\d+)", e.description)
+                if e.status == 429 and retry:
+                    time.sleep(min(int(retry.group(1)), 10))
+                    self.dirty.add((chat_id, message_id))
+                elif "not modified" not in e.description:
+                    print(f"[反馈bot] 重绘消息 {message_id} 失败: {e}")
+            except Exception as e:
+                print(f"[反馈bot] 重绘消息 {message_id} 失败: {type(e).__name__}: {e}")
+
+    def redraw(self, chat_id: str, message_id: int) -> None:
+        """按草稿或已提交的反馈重绘 Rich Message 摘要"""
+        text = self.store.message_text(chat_id, message_id)
+        if not text:
+            return
+        draft = self.drafts.get((chat_id, message_id))
+        if draft:
+            code, picked = draft
+            html_text, markup = to_rich_html(text, code, picked), picking_keyboard(code, len(picked))
+        else:
+            html_text, markup = to_rich_html(text), base_keyboard(self.store.counts(chat_id, message_id))
+        chat = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
+        self.api("editMessageText", chat_id=chat, message_id=message_id, rich_message={"html": html_text},
+                 reply_markup=markup)
 
     def run_forever(self) -> None:
         while True:
@@ -183,6 +220,11 @@ class FeedbackBot:
                 if "not modified" not in e.description:
                     raise
 
+        key = (str(chat_id), int(message_id or 0))
+        if message_id and data.startswith(("fb:", "fv:")) and self.store.message_text(chat_id, message_id):
+            self.handle_rich_callback(key, data, user_id, answer)
+            return
+
         if data in ("fb:l", "fb:d"):
             code = data[-1]
             items = self.store.message_items(chat_id, message_id)
@@ -205,7 +247,7 @@ class FeedbackBot:
             answer(f"{icon} {item['title']}" if on else f"已取消：{item['title']}")
             set_markup(grid_keyboard([i["n"] for i in items], code, self.store.selected(chat_id, message_id, label)))
         elif data == "fb:back":
-            set_markup(base_keyboard())
+            set_markup(base_keyboard(self.store.counts(chat_id, message_id)))
             answer()
         elif data.startswith("sg:"):
             _, action, sid = data.split(":")
@@ -218,6 +260,39 @@ class FeedbackBot:
             answer(text)
         else:
             answer()
+
+    def handle_rich_callback(self, key: Tuple[str, int], data: str, user_id, answer) -> None:
+        """Rich Message 摘要：勾选只改草稿、不弹提示，提交时一次写入；重绘留到这批更新处理完"""
+        chat_id, message_id = key
+        if data in ("fb:l", "fb:d"):
+            code = data[-1]
+            self.drafts[key] = (code, self.store.selected(chat_id, message_id, LABELS[code]))
+            answer()
+        elif data.startswith("fv:"):
+            _, code, n = data.split(":")
+            draft = self.drafts.get(key)
+            if not draft or draft[0] != code:
+                # bot 重启后草稿丢失，从已提交的反馈接着勾
+                draft = (code, self.store.selected(chat_id, message_id, LABELS[code]))
+                self.drafts[key] = draft
+            draft[1].symmetric_difference_update({int(n)})
+            answer()
+        elif data == "fb:ok":
+            draft = self.drafts.pop(key, None)
+            if not draft:
+                answer()
+            else:
+                code, picked = draft
+                items = self.store.message_items(chat_id, message_id)
+                count = self.store.replace(chat_id, message_id, items, LABELS[code], picked, user_id, self.now())
+                answer(f"已记录 {count} 条" + ("感兴趣" if code == "l" else "不感兴趣"))
+        elif data == "fb:back":
+            self.drafts.pop(key, None)
+            answer()
+        else:
+            answer()
+            return
+        self.dirty.add(key)
 
     def handle_message(self, message: Dict) -> None:
         text = (message.get("text") or "").strip()

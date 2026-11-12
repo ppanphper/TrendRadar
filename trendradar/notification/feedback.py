@@ -22,10 +22,26 @@ def feedback_db_path(data_dir: str) -> Path:
     return Path(data_dir) / "meta" / "feedback.db"
 
 
-def base_keyboard() -> Dict:
+def base_keyboard(counts: Optional[Dict[str, int]] = None) -> Dict:
+    """消息底部的 👍 / 👎；已标记过的显示条数并变色，便于看出这条消息处理过"""
+    counts = counts or {}
+    row = []
+    for code, style in (("l", "success"), ("d", "danger")):
+        label = LABELS[code]
+        button = {"text": LABEL_TEXT[label], "callback_data": f"fb:{code}"}
+        if counts.get(label):
+            button["text"] += f" · {counts[label]}"
+            button["style"] = style
+        row.append(button)
+    return {"inline_keyboard": [row]}
+
+
+def picking_keyboard(code: str, count: int) -> Dict:
+    """正文勾选状态的底部按钮：勾选只是草稿，提交后才记录"""
+    icon = LABEL_TEXT[LABELS[code]].split()[0]
     return {"inline_keyboard": [[
-        {"text": LABEL_TEXT["like"], "callback_data": "fb:l"},
-        {"text": LABEL_TEXT["dislike"], "callback_data": "fb:d"},
+        {"text": "取消", "callback_data": "fb:back"},
+        {"text": f"提交 {icon} {count} 条", "callback_data": "fb:ok"},
     ]]}
 
 
@@ -71,17 +87,27 @@ class FeedbackStore:
                     status TEXT NOT NULL, summary TEXT, content TEXT NOT NULL);
                 """
             )
+            # text：以 Rich Message 发出的摘要原文，回调时据此重绘；为空表示普通消息，沿用编号网格
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+            if "text" not in columns:
+                try:
+                    conn.execute("ALTER TABLE messages ADD COLUMN text TEXT")
+                except sqlite3.OperationalError as e:
+                    # 主程序和 bot 同时初始化时，另一方可能已经加上
+                    if "duplicate column" not in str(e):
+                        raise
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path, timeout=10)
 
     # --- 消息映射 ---
 
-    def save_message(self, chat_id, message_id: int, items: List[Dict], now: datetime) -> None:
+    def save_message(self, chat_id, message_id: int, items: List[Dict], now: datetime, text: Optional[str] = None) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO messages (chat_id, message_id, sent_at, items) VALUES (?, ?, ?, ?)",
-                (str(chat_id), int(message_id), now.strftime("%Y-%m-%d %H:%M:%S"), json.dumps(items, ensure_ascii=False)),
+                "INSERT OR REPLACE INTO messages (chat_id, message_id, sent_at, items, text) VALUES (?, ?, ?, ?, ?)",
+                (str(chat_id), int(message_id), now.strftime("%Y-%m-%d %H:%M:%S"),
+                 json.dumps(items, ensure_ascii=False), text),
             )
             cutoff = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
             conn.execute("DELETE FROM messages WHERE sent_at < ?", (cutoff,))
@@ -92,6 +118,13 @@ class FeedbackStore:
                 "SELECT items FROM messages WHERE chat_id = ? AND message_id = ?", (str(chat_id), int(message_id))
             ).fetchone()
         return json.loads(row[0]) if row else []
+
+    def message_text(self, chat_id, message_id: int) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT text FROM messages WHERE chat_id = ? AND message_id = ?", (str(chat_id), int(message_id))
+            ).fetchone()
+        return row[0] if row else None
 
     # --- 反馈 ---
 
@@ -123,6 +156,40 @@ class FeedbackStore:
                 (str(chat_id), int(message_id), label),
             ).fetchall()
         return {row[0] for row in rows}
+
+    def replace(self, chat_id, message_id: int, items: List[Dict], label: str, selected: Set[int], user_id,
+                now: datetime) -> int:
+        """批量提交：本条消息的 label 反馈改成 selected 这些条目，选中的条目去掉相反反馈；返回记录条数"""
+        by_n = {int(i["n"]): i for i in items}
+        selected = {n for n in selected if n in by_n}
+        key = (str(chat_id), int(message_id))
+        opposite = "dislike" if label == "like" else "like"
+        with self._connect() as conn:
+            existing = {row[0] for row in conn.execute(
+                "SELECT n FROM feedback WHERE chat_id = ? AND message_id = ? AND label = ?", key + (label,)
+            )}
+            for n in existing - selected:
+                conn.execute("DELETE FROM feedback WHERE chat_id = ? AND message_id = ? AND n = ? AND label = ?",
+                             key + (n, label))
+            for n in sorted(selected - existing):
+                item = by_n[n]
+                conn.execute("DELETE FROM feedback WHERE chat_id = ? AND message_id = ? AND n = ? AND label = ?",
+                             key + (n, opposite))
+                conn.execute(
+                    "INSERT INTO feedback (chat_id, message_id, n, label, title, url, source, grp, user_id, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    key + (n, label, item.get("title", ""), item.get("url", ""), item.get("source", ""),
+                           item.get("group", ""), str(user_id or ""), now.strftime("%Y-%m-%d %H:%M:%S")),
+                )
+        return len(selected)
+
+    def counts(self, chat_id, message_id: int) -> Dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT label, COUNT(*) FROM feedback WHERE chat_id = ? AND message_id = ? GROUP BY label",
+                (str(chat_id), int(message_id)),
+            ).fetchall()
+        return {row[0]: row[1] for row in rows}
 
     def recent(self, label: str, limit: int = 20, since: Optional[str] = None) -> List[Dict]:
         sql = "SELECT title, source, grp, created_at FROM feedback WHERE label = ?"
