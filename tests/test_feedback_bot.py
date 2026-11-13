@@ -1,9 +1,10 @@
-"""推送反馈：消息映射、编号网格、正文勾选与批量提交、反馈切换、权限、后台应答、兴趣建议的生成与应用、分类提示附带反馈。"""
+"""推送反馈：消息映射、编号网格、正文勾选与批量提交、反馈切换、权限、后台应答与重绘、连接轮换、兴趣建议的生成与应用、分类提示附带反馈。"""
 
 import io
 import os
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime
@@ -13,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from trendradar.bot import FeedbackBot
+from trendradar.bot import ANSWER_WORKERS, SEND_TIMEOUT, FeedbackBot
 from trendradar.notification.feedback import FeedbackStore, feedback_db_path, grid_keyboard
 
 NOW = datetime(2026, 11, 15, 21, 30, tzinfo=ZoneInfo("Asia/Shanghai"))  # 周日
@@ -21,6 +22,7 @@ ITEMS = [
     {"n": 1, "title": "大模型发布", "url": "https://a", "source": "知乎", "group": "大模型"},
     {"n": 2, "title": "明星八卦", "url": "https://b", "source": "微博", "group": "文化"},
 ]
+RICH_TEXT = "<b>📰 摘要</b>\n\n<b>大模型</b> · 2\n<code>1</code> 大模型发布\n<code>2</code> 明星八卦"
 
 
 class InlineExecutor:
@@ -37,6 +39,54 @@ def reply(result):
     response = MagicMock()
     response.json.return_value = {"ok": True, "result": result}
     return response
+
+
+def wait_until(condition, timeout=3):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("等待超时")
+        time.sleep(0.01)
+
+
+class FakeTelegram:
+    """测试用的 Bot API：按方法名分派，记下每条连接的请求，并检查同一连接有没有被两个线程同时占用"""
+
+    def __init__(self, batches=(), edit=None, answer=None):
+        self.batches = list(batches)  # getUpdates 依次返回的批次
+        self.edit, self.answer = edit, answer
+        self.posted, self.edits, self.timeouts = [], [], {}
+        self.sessions, self.overlaps = [], []
+        self.lock = threading.Lock()
+
+    def session(self):
+        session = MagicMock()
+        busy = threading.Lock()
+
+        def post(url, json=None, timeout=None, **kw):
+            method = url.rsplit("/", 1)[1]
+            if not busy.acquire(blocking=False):
+                self.overlaps.append(method)
+                busy.acquire()
+            try:
+                with self.lock:
+                    self.posted.append(method)
+                    self.timeouts[method] = timeout
+                if method == "getUpdates":
+                    return reply(self.batches.pop(0) if self.batches else [])
+                if method == "editMessageText":
+                    if self.edit:
+                        self.edit(json)
+                    self.edits.append(json)
+                elif method == "answerCallbackQuery" and self.answer:
+                    self.answer(json)
+                return reply(True)
+            finally:
+                busy.release()
+
+        session.post.side_effect = post
+        self.sessions.append(session)
+        return session
 
 
 def callback_update(update_id, data, message_id=20):
@@ -76,8 +126,7 @@ class BotTest(unittest.TestCase):
         return dict(self.calls)
 
     def test_rich_message_picking_and_batch_submit(self):
-        text = "<b>📰 摘要</b>\n\n<b>大模型</b> · 2\n<code>1</code> 大模型发布\n<code>2</code> 明星八卦"
-        self.bot.store.save_message("-100", 20, ITEMS, NOW, text=text)
+        self.bot.store.save_message("-100", 20, ITEMS, NOW, text=RICH_TEXT)
 
         calls = self._callback("fb:d", message_id=20)
         self.assertEqual(calls["answerCallbackQuery"]["text"], "")
@@ -123,23 +172,43 @@ class BotTest(unittest.TestCase):
         self.assertEqual([f["title"] for f in self.bot.store.recent("like")], ["明星八卦"])
         self.assertEqual(self.bot.store.recent("dislike"), [])
 
-    def _polling_bot(self, updates, answer):
-        """真实的 api()：轮询和重绘走 main，回调应答由 answer 处理"""
-        self.bot.store.save_message("-100", 20, ITEMS, NOW, text="<b>📰 摘要</b>\n<code>1</code> 大模型发布")
-        posted = []
-        main = MagicMock()
-        main.post.side_effect = lambda url, **kw: posted.append(url.rsplit("/", 1)[1]) or reply(
-            updates if url.endswith("getUpdates") else True)
-        worker = MagicMock()
-        worker.post.side_effect = lambda url, **kw: answer(kw["json"]) or reply(True)
-        bot = FeedbackBot(self.config, session=main)
+    def _real_bot(self, telegram):
+        """走真实的 api()、连接池、应答线程池和重绘线程"""
+        self.bot.store.save_message("-100", 20, ITEMS, NOW, text=RICH_TEXT)
+        bot = FeedbackBot(self.config, session_factory=telegram.session)
         bot.now = lambda: NOW
-        # 后台线程启动时新建的 Session 换成 worker
-        patcher = patch("trendradar.bot.requests.Session", return_value=worker)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.addCleanup(lambda: bot.answers.shutdown())
-        return bot, posted
+        self.addCleanup(bot.close)
+        return bot
+
+    def test_polling_continues_while_redraw_in_flight(self):
+        released = threading.Event()
+
+        def slow_first_edit(payload):
+            if not telegram.posted.count("editMessageText") > 1:
+                released.wait(3)
+
+        telegram = FakeTelegram(
+            [[callback_update(5, "fb:d")], [callback_update(6, "fv:d:1")], [callback_update(7, "fv:d:2")]],
+            edit=slow_first_edit,
+        )
+        bot = self._real_bot(telegram)
+        bot.start_redrawer()
+        self.assertEqual(bot.poll_once(timeout=0), 1)
+        wait_until(lambda: "editMessageText" in telegram.posted)
+        # 第一次重绘还没返回，轮询照常收到后两次勾选
+        self.assertEqual(bot.poll_once(timeout=0), 1)
+        self.assertEqual(bot.poll_once(timeout=0), 1)
+        self.assertEqual(telegram.edits, [])
+        released.set()
+        # 重绘一条一条发，期间的勾选合并成一次，画的是最新状态
+        wait_until(lambda: len(telegram.edits) == 2)
+        time.sleep(0.1)
+        self.assertEqual(len(telegram.edits), 2)
+        html = telegram.edits[1]["rich_message"]["html"]
+        self.assertIn('data="fv:d:1">✅</tg-button>', html)
+        self.assertIn('data="fv:d:2">✅</tg-button>', html)
+        self.assertEqual(telegram.overlaps, [])
+        self.assertEqual(telegram.timeouts["editMessageText"], SEND_TIMEOUT)
 
     def test_answer_in_background_does_not_delay_redraw(self):
         released, answered = threading.Event(), []
@@ -148,40 +217,84 @@ class BotTest(unittest.TestCase):
             released.wait(5)
             answered.append(payload["callback_query_id"])
 
-        bot, posted = self._polling_bot([callback_update(5, "fb:d")], slow_answer)
+        telegram = FakeTelegram([[callback_update(5, "fb:d")]], answer=slow_answer)
+        bot = self._real_bot(telegram)
         self.assertEqual(bot.poll_once(timeout=0), 1)
-        # 应答还卡着，重绘已经发出；应答不占用轮询的 Session
-        self.assertEqual(posted, ["getUpdates", "editMessageText"])
+        bot.flush_redraws()
+        # 应答还卡着，重绘已经发出，两者用的是不同连接
+        self.assertEqual(len(telegram.edits), 1)
         self.assertEqual(answered, [])
         released.set()
         bot.answers.shutdown(wait=True)
         self.assertEqual(answered, ["cb5"])
+        self.assertEqual(telegram.overlaps, [])
+        self.assertEqual(telegram.timeouts["answerCallbackQuery"], SEND_TIMEOUT)
 
     def test_batch_answers_are_sent_concurrently(self):
-        barrier, answered = threading.Barrier(3, timeout=2), []
+        barrier, answered = threading.Barrier(ANSWER_WORKERS, timeout=2), []
 
         def answer(payload):
-            barrier.wait()  # 串行应答时等不齐三个，超时报错
+            barrier.wait()  # 串行应答时等不齐，超时报错
             answered.append(payload["callback_query_id"])
 
-        updates = [callback_update(5, "fb:d"), callback_update(6, "fv:d:1"), callback_update(7, "fv:d:2")]
-        bot, posted = self._polling_bot(updates, answer)
+        updates = [callback_update(5 + i, f"fv:d:{i + 1}") for i in range(ANSWER_WORKERS)]
+        telegram = FakeTelegram([updates], answer=answer)
+        bot = self._real_bot(telegram)
         bot.poll_once(timeout=0)
+        bot.flush_redraws()
         bot.answers.shutdown(wait=True)
-        self.assertEqual(sorted(answered), ["cb5", "cb6", "cb7"])
-        self.assertEqual(posted.count("editMessageText"), 1)
+        self.assertEqual(sorted(answered), [f"cb{5 + i}" for i in range(ANSWER_WORKERS)])
+        self.assertEqual(len(telegram.edits), 1)
 
     def test_answer_failure_is_logged_without_blocking_redraw(self):
         def fail(payload):
             raise requests.ConnectionError("proxy down")
 
-        bot, posted = self._polling_bot([callback_update(5, "fb:d")], fail)
+        telegram = FakeTelegram([[callback_update(5, "fb:d")]], answer=fail)
+        bot = self._real_bot(telegram)
         out = io.StringIO()
         with redirect_stdout(out):
             bot.poll_once(timeout=0)
+            bot.flush_redraws()
             bot.answers.shutdown(wait=True)
-        self.assertIn("editMessageText", posted)
+        self.assertEqual(len(telegram.edits), 1)
         self.assertIn("应答回调失败", out.getvalue())
+
+    def test_redraw_retries_once_after_connection_error(self):
+        failures = [requests.ConnectionError("reset")]
+
+        def flaky(payload):
+            if failures:
+                raise failures.pop()
+
+        telegram = FakeTelegram(edit=flaky)
+        bot = self._real_bot(telegram)
+        bot.answers = InlineExecutor()
+        bot.handle_update(callback_update(5, "fb:d"))
+        bot.flush_redraws()
+        # 换一条连接重画成功，用户看到的勾选状态和草稿一致
+        self.assertEqual(telegram.posted.count("editMessageText"), 2)
+        self.assertEqual(len(telegram.edits), 1)
+
+        # 连续失败只重试一次，记日志后不再占着重绘
+        failures.extend([requests.ConnectionError("reset")] * 3)
+        bot.handle_update(callback_update(6, "fv:d:1"))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            bot.flush_redraws()
+        self.assertEqual(telegram.posted.count("editMessageText"), 4)
+        self.assertIn("重绘消息 20 失败", out.getvalue())
+
+    def test_sessions_rotate_so_none_sits_idle(self):
+        telegram = FakeTelegram()
+        bot = FeedbackBot(self.config, session_factory=telegram.session)
+        self.addCleanup(bot.close)
+        # 至少能同时容纳轮询、重绘和全部应答线程
+        self.assertGreaterEqual(len(telegram.sessions), ANSWER_WORKERS + 2)
+        # 空闲时长轮询依次用到每条连接，任何一条都不会闲置到被服务端断开
+        for _ in range(len(telegram.sessions) * 2):
+            bot.api("getUpdates", timeout=0)
+        self.assertEqual([s.post.call_count for s in telegram.sessions], [2] * len(telegram.sessions))
 
     def test_grid_and_toggle(self):
         calls = self._callback("fb:d")
@@ -242,12 +355,12 @@ class BotTest(unittest.TestCase):
         self.assertIsNotNone(self.bot.store.last_suggestion_at())
 
     def test_poll_once_sends_long_poll_timeout_and_advances_offset(self):
-        bot = FeedbackBot(self.config)
         session = MagicMock()
         session.post.return_value.json.return_value = {"ok": True, "result": [
             {"update_id": 41, "message": {"text": "hi", "chat": {"id": -100}, "from": {"id": 7}}},
         ]}
-        bot.session = session
+        bot = FeedbackBot(self.config, session_factory=lambda: session)
+        self.addCleanup(bot.close)
         self.assertEqual(bot.poll_once(timeout=50), 1)
         kwargs = session.post.call_args.kwargs
         self.assertEqual(kwargs["json"]["timeout"], 50)

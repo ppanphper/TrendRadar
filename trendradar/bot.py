@@ -13,6 +13,7 @@ import difflib
 import html
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -40,7 +41,11 @@ POLL_TIMEOUT = 50
 WEEKLY_WEEKDAY = 7       # 周日
 WEEKLY_HOUR = 21
 MIN_FEEDBACK_FOR_SUGGESTION = 3
-ANSWER_WORKERS = 4       # 同时发出的回调应答数
+ANSWER_WORKERS = 2       # 同时发出的回调应答数
+# 连接池：轮询、重绘和应答各取一条，用完放回队尾；空闲时长轮询依次用到每条连接，
+# 每条最多闲置 (池大小 - 1) × POLL_TIMEOUT 秒，实测经代理闲置 300 秒的连接仍可复用
+SESSION_POOL_SIZE = ANSWER_WORKERS + 2
+SEND_TIMEOUT = 10        # 重绘和应答的本地超时；连接失效时尽快换一条，不像长轮询那样等满 60 秒
 
 # 注册到 Telegram 的命令菜单：在群里输入 / 时弹出，可按文字筛选
 COMMANDS = [
@@ -56,7 +61,7 @@ class TelegramError(Exception):
 
 
 class FeedbackBot:
-    def __init__(self, config: Dict, session: Optional[requests.Session] = None):
+    def __init__(self, config: Dict, session_factory=requests.Session):
         self.config = config
         tokens = parse_multi_account_config(config.get("TELEGRAM_BOT_TOKEN", ""))
         self.token = tokens[0] if tokens else ""
@@ -67,31 +72,43 @@ class FeedbackBot:
         self.timezone = config.get("TIMEZONE", DEFAULT_TIMEZONE)
         data_dir = config.get("STORAGE", {}).get("LOCAL", {}).get("DATA_DIR", "output")
         self.store = FeedbackStore(feedback_db_path(data_dir))
-        self.session = session or requests.Session()
+        self.sessions: "queue.Queue[requests.Session]" = queue.Queue()
+        for _ in range(SESSION_POOL_SIZE):
+            self.sessions.put(session_factory())
         proxy = config.get("DEFAULT_PROXY") if config.get("USE_PROXY") else None
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
         self.offset: Optional[int] = None
         self.username = ""
         # 正文勾选的草稿：(chat_id, message_id) -> (反馈代码, 已勾选编号)；提交前只存在内存里
         self.drafts: Dict[Tuple[str, int], Tuple[str, Set[int]]] = {}
-        # 待重绘的 Rich Message；一批更新处理完再统一重绘，连续勾选只编辑一次
+        # 待重绘的 Rich Message；重绘线程一条一条编辑，编辑期间的连续勾选合并成一次
         self.dirty: Set[Tuple[str, int]] = set()
-        # 回调应答在后台线程发出，重绘不用等它返回；requests.Session 不保证线程安全，后台线程各用自己的
-        self._local = threading.local()
-        self.answers = ThreadPoolExecutor(ANSWER_WORKERS, thread_name_prefix="answer", initializer=self._init_worker)
+        # drafts 和 dirty 由轮询线程修改、重绘线程读取
+        self.lock = threading.Lock()
+        self.redraw_wanted = threading.Condition(self.lock)
+        self.closed = False
+        # 回调应答在后台线程发出，重绘不用等它返回
+        self.answers = ThreadPoolExecutor(ANSWER_WORKERS, thread_name_prefix="answer")
+
+    def close(self) -> None:
+        with self.redraw_wanted:
+            self.closed = True
+            self.redraw_wanted.notify_all()
+        self.answers.shutdown(wait=True)
 
     # --- Telegram API ---
 
-    def _init_worker(self) -> None:
-        self._local.session = requests.Session()
-
     def api(self, method: str, http_timeout: int = 30, **payload):
         # http_timeout 是本地请求超时；payload 里的 timeout 是 getUpdates 长轮询的服务端等待时间
-        session = getattr(self._local, "session", None) or self.session
-        response = session.post(
-            f"https://api.telegram.org/bot{self.token}/{method}",
-            json=payload, proxies=self.proxies, timeout=http_timeout,
-        )
+        # requests.Session 不保证线程安全，每次请求独占一条连接
+        session = self.sessions.get()
+        try:
+            response = session.post(
+                f"https://api.telegram.org/bot{self.token}/{method}",
+                json=payload, proxies=self.proxies, timeout=http_timeout,
+            )
+        finally:
+            self.sessions.put(session)
         try:
             data = response.json()
         except ValueError:
@@ -106,7 +123,7 @@ class FeedbackBot:
 
     def _answer_callback(self, callback_id: str, text: str) -> None:
         try:
-            self.api("answerCallbackQuery", callback_query_id=callback_id, text=text)
+            self.api("answerCallbackQuery", http_timeout=SEND_TIMEOUT, callback_query_id=callback_id, text=text)
         except Exception as e:
             print(f"[反馈bot] 应答回调失败: {type(e).__name__}: {e}")
 
@@ -146,38 +163,71 @@ class FeedbackBot:
                 self.handle_update(update)
             except Exception as e:
                 print(f"[反馈bot] 处理更新 {update.get('update_id')} 失败: {type(e).__name__}: {e}")
-        self.flush_redraws()
+        # 整批处理完再叫醒重绘线程，同一批的多次勾选只编辑一次
+        with self.redraw_wanted:
+            if self.dirty:
+                self.redraw_wanted.notify()
         return len(updates)
 
+    def start_redrawer(self) -> None:
+        """重绘放到单独线程：编辑消息期间轮询照常进行，下一次勾选不用等这次重绘返回"""
+        threading.Thread(target=self._redraw_loop, name="redraw", daemon=True).start()
+
+    def _redraw_loop(self) -> None:
+        while True:
+            with self.redraw_wanted:
+                self.redraw_wanted.wait_for(lambda: self.dirty or self.closed)
+                if self.closed:
+                    return
+            self.flush_redraws()
+
     def flush_redraws(self) -> None:
-        while self.dirty:
-            chat_id, message_id = self.dirty.pop()
+        retried: Set[Tuple[str, int]] = set()
+        while True:
+            # 取出时复制草稿，之后的勾选会重新标记，最后一次编辑总是最新状态
+            with self.lock:
+                if not self.dirty:
+                    return
+                key = self.dirty.pop()
+                draft = self.drafts.get(key)
+                draft = (draft[0], set(draft[1])) if draft else None
+            chat_id, message_id = key
             try:
-                self.redraw(chat_id, message_id)
+                self.redraw(chat_id, message_id, draft)
             except TelegramError as e:
                 retry = re.search(r"retry after (\d+)", e.description)
                 if e.status == 429 and retry:
                     time.sleep(min(int(retry.group(1)), 10))
-                    self.dirty.add((chat_id, message_id))
+                    self._mark_dirty(key)
                 elif "not modified" not in e.description:
                     print(f"[反馈bot] 重绘消息 {message_id} 失败: {e}")
+            except requests.RequestException as e:
+                # 连接失效时换一条连接再画一次，否则用户看到的勾选和草稿对不上
+                if key in retried:
+                    print(f"[反馈bot] 重绘消息 {message_id} 失败: {type(e).__name__}: {e}")
+                else:
+                    retried.add(key)
+                    self._mark_dirty(key)
             except Exception as e:
                 print(f"[反馈bot] 重绘消息 {message_id} 失败: {type(e).__name__}: {e}")
 
-    def redraw(self, chat_id: str, message_id: int) -> None:
+    def _mark_dirty(self, key: Tuple[str, int]) -> None:
+        with self.lock:
+            self.dirty.add(key)
+
+    def redraw(self, chat_id: str, message_id: int, draft: Optional[Tuple[str, Set[int]]]) -> None:
         """按草稿或已提交的反馈重绘 Rich Message 摘要"""
         text = self.store.message_text(chat_id, message_id)
         if not text:
             return
-        draft = self.drafts.get((chat_id, message_id))
         if draft:
             code, picked = draft
             html_text, markup = to_rich_html(text, code, picked), picking_keyboard(code, len(picked))
         else:
             html_text, markup = to_rich_html(text), base_keyboard(self.store.counts(chat_id, message_id))
         chat = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
-        self.api("editMessageText", chat_id=chat, message_id=message_id, rich_message={"html": html_text},
-                 reply_markup=markup)
+        self.api("editMessageText", http_timeout=SEND_TIMEOUT, chat_id=chat, message_id=message_id,
+                 rich_message={"html": html_text}, reply_markup=markup)
 
     def run_forever(self) -> None:
         while True:
@@ -188,6 +238,7 @@ class FeedbackBot:
                 print(f"[反馈bot] 连接 Telegram 失败: {e}")
             time.sleep(300)
 
+        self.start_redrawer()
         backoff = 5
         while True:
             try:
@@ -282,37 +333,38 @@ class FeedbackBot:
             answer()
 
     def handle_rich_callback(self, key: Tuple[str, int], data: str, user_id, answer) -> None:
-        """Rich Message 摘要：勾选只改草稿、不弹提示，提交时一次写入；重绘留到这批更新处理完"""
-        chat_id, message_id = key
-        if data in ("fb:l", "fb:d"):
-            code = data[-1]
-            self.drafts[key] = (code, self.store.selected(chat_id, message_id, LABELS[code]))
-            answer()
-        elif data.startswith("fv:"):
-            _, code, n = data.split(":")
-            draft = self.drafts.get(key)
-            if not draft or draft[0] != code:
-                # bot 重启后草稿丢失，从已提交的反馈接着勾
-                draft = (code, self.store.selected(chat_id, message_id, LABELS[code]))
-                self.drafts[key] = draft
-            draft[1].symmetric_difference_update({int(n)})
-            answer()
-        elif data == "fb:ok":
-            draft = self.drafts.pop(key, None)
-            if not draft:
+        """Rich Message 摘要：勾选只改草稿、不弹提示，提交时一次写入；重绘交给重绘线程"""
+        with self.lock:
+            chat_id, message_id = key
+            if data in ("fb:l", "fb:d"):
+                code = data[-1]
+                self.drafts[key] = (code, self.store.selected(chat_id, message_id, LABELS[code]))
+                answer()
+            elif data.startswith("fv:"):
+                _, code, n = data.split(":")
+                draft = self.drafts.get(key)
+                if not draft or draft[0] != code:
+                    # bot 重启后草稿丢失，从已提交的反馈接着勾
+                    draft = (code, self.store.selected(chat_id, message_id, LABELS[code]))
+                    self.drafts[key] = draft
+                draft[1].symmetric_difference_update({int(n)})
+                answer()
+            elif data == "fb:ok":
+                draft = self.drafts.pop(key, None)
+                if not draft:
+                    answer()
+                else:
+                    code, picked = draft
+                    items = self.store.message_items(chat_id, message_id)
+                    count = self.store.replace(chat_id, message_id, items, LABELS[code], picked, user_id, self.now())
+                    answer(f"已记录 {count} 条" + ("感兴趣" if code == "l" else "不感兴趣"))
+            elif data == "fb:back":
+                self.drafts.pop(key, None)
                 answer()
             else:
-                code, picked = draft
-                items = self.store.message_items(chat_id, message_id)
-                count = self.store.replace(chat_id, message_id, items, LABELS[code], picked, user_id, self.now())
-                answer(f"已记录 {count} 条" + ("感兴趣" if code == "l" else "不感兴趣"))
-        elif data == "fb:back":
-            self.drafts.pop(key, None)
-            answer()
-        else:
-            answer()
-            return
-        self.dirty.add(key)
+                answer()
+                return
+            self.dirty.add(key)
 
     def handle_message(self, message: Dict) -> None:
         text = (message.get("text") or "").strip()
