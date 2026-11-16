@@ -317,6 +317,10 @@ def _load_ai_translation_config(config_data: Dict) -> Dict:
         "ENABLED": enabled_env if enabled_env is not None else trans_config.get("enabled", False),
         "LANGUAGE": _get_env_str("AI_TRANSLATION_LANGUAGE") or trans_config.get("language", "English"),
         "PROMPT_FILE": trans_config.get("prompt_file", "ai_translation_prompt.txt"),
+        "BATCH_SIZE": trans_config.get("batch_size", 100),
+        "BATCH_INTERVAL": trans_config.get("batch_interval", 2),
+        "SKIP_TARGET_LANGUAGE": bool(trans_config.get("skip_target_language", False)),
+        "CACHE_DAYS": int(trans_config.get("cache_days", 0) or 0),
         "SCOPE": {
             "HOTLIST": scope.get("hotlist", True),
             "RSS": scope.get("rss", True),

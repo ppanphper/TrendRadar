@@ -32,6 +32,7 @@ class BatchTranslationResult:
     prompt: str = ""                # debug: 发送给 AI 的完整 prompt
     raw_response: str = ""          # debug: AI 原始响应
     parsed_count: int = 0           # debug: AI 响应解析出的条目数
+    aligned: bool = False           # AI 返回的编号恰好是 1..N 且不重复（可放心缓存）
 
 
 class AITranslator:
@@ -184,8 +185,9 @@ class AITranslator:
             batch_result.raw_response = response
 
             # 解析批量翻译结果
-            translated_texts, raw_parsed_count = self._parse_batch_response(response, len(non_empty_texts))
+            translated_texts, raw_parsed_count, aligned = self._parse_batch_response(response, len(non_empty_texts))
             batch_result.parsed_count = raw_parsed_count
+            batch_result.aligned = aligned
 
             # 填充结果（跳过空翻译，避免用空字符串覆盖原始标题）
             for idx, translated in zip(non_empty_indices, translated_texts):
@@ -222,7 +224,7 @@ class AITranslator:
             expected_count: 期望的翻译数量
 
         Returns:
-            tuple: (翻译结果列表, AI 原始解析出的条目数)
+            tuple: (翻译结果列表, AI 原始解析出的条目数, 编号是否恰好为 1..N 且不重复)
         """
         results = []
         lines = response.strip().split("\n")
@@ -255,6 +257,7 @@ class AITranslator:
 
         # 基于 AI 返回的真实编号精确回填，而非位置顺序，避免 AI 漏号/乱序时整体错位
         raw_parsed_count = len(results)
+        aligned = bool(results) and sorted(idx for idx, _ in results) == list(range(1, expected_count + 1))
 
         if results:
             # 编号 i(1-based) 对应位置 i-1；缺失的编号位置留空（由上层保留原文），
@@ -280,7 +283,7 @@ class AITranslator:
         while len(translated) < expected_count:
             translated.append("")
 
-        return translated[:expected_count], raw_parsed_count
+        return translated[:expected_count], raw_parsed_count, aligned
 
     def _call_ai(self, user_prompt: str) -> str:
         """调用 AI API（使用 LiteLLM）"""

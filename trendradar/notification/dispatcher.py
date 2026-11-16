@@ -159,27 +159,56 @@ class NotificationDispatcher:
             print("[翻译] 没有需要翻译的内容")
             return report_data, rss_items, rss_new_items, standalone_data
 
+        from trendradar.ai.translation_cache import already_in_language
+        from trendradar.ai.translator import BatchTranslationResult
+
         total_count = len(titles_to_translate)
         trans_config = self.config.get("AI_TRANSLATION", {})
         batch_size = trans_config.get("BATCH_SIZE", 100)
         batch_interval = trans_config.get("BATCH_INTERVAL", 2)
-        num_batches = (total_count + batch_size - 1) // batch_size
+        language = self.translator.target_language
+        cache = self._translation_cache(trans_config)
 
+        # 已知译文不送 AI：空文本、已是目标语言（skip_target_language）、缓存命中（cache_days）；其余去重后分批
+        known: Dict[str, str] = {}
+        unique = list(dict.fromkeys(titles_to_translate))
+        skipped = 0
+        for text in unique:
+            if not text or not text.strip():
+                known[text] = text
+            elif trans_config.get("SKIP_TARGET_LANGUAGE", False) and already_in_language(text, language):
+                known[text] = text
+                skipped += 1
+        cached: Dict[str, str] = {}
+        if cache:
+            try:
+                cached = cache.get_many(language, [t for t in unique if t not in known])
+            except Exception as e:
+                print(f"[翻译] 读取译文缓存失败，本轮不用缓存: {type(e).__name__}: {e}")
+        known.update(cached)
+        pending = [t for t in unique if t not in known]
+
+        notes = [
+            f"已是{language} {skipped} 条" if skipped else "",
+            f"缓存命中 {len(cached)} 条" if cached else "",
+            f"重复 {total_count - len(unique)} 条" if total_count > len(unique) else "",
+        ]
+        note = "，".join(n for n in notes if n)
+        num_batches = (len(pending) + batch_size - 1) // batch_size
+        summary = f"[翻译] 共 {total_count} 条标题" + (f"（{note}）" if note else "") + f"，送 AI {len(pending)} 条"
         if num_batches > 1:
-            print(f"[翻译] 共 {total_count} 条标题待翻译，分 {num_batches} 批（每批 {batch_size} 条，间隔 {batch_interval}s）")
-        else:
-            print(f"[翻译] 共 {total_count} 条标题待翻译")
+            summary += f"，分 {num_batches} 批（每批 {batch_size} 条，间隔 {batch_interval}s）"
+        print(summary)
 
         # 分批翻译
-        from trendradar.ai.translator import BatchTranslationResult
-
-        merged_result = BatchTranslationResult(total_count=total_count)
+        merged_result = BatchTranslationResult(total_count=len(pending))
+        fresh: Dict[str, str] = {}      # 本轮新译文，写入缓存
         batch_count = 0
 
-        for i in range(0, total_count, batch_size):
+        for i in range(0, len(pending), batch_size):
             if batch_count > 0 and batch_interval > 0:
                 time.sleep(batch_interval)
-            batch_texts = titles_to_translate[i:i + batch_size]
+            batch_texts = pending[i:i + batch_size]
             batch_num = batch_count + 1
             if num_batches > 1:
                 print(f"[翻译] 第 {batch_num}/{num_batches} 批（{len(batch_texts)} 条）...")
@@ -187,6 +216,14 @@ class NotificationDispatcher:
             merged_result.results.extend(result.results)
             merged_result.success_count += result.success_count
             merged_result.fail_count += result.fail_count
+
+            # 只缓存编号恰好为 1..N 的批次，且译文与原文不同，避免错位或漏译的结果长期留在缓存里
+            for text, res in zip(batch_texts, result.results):
+                translated = res.translated_text if res.success else ""
+                if translated and translated.strip():
+                    known[text] = translated
+                    if result.aligned and translated != text:
+                        fresh[text] = translated
 
             # debug 模式：输出每批的详细信息
             if self.config.get("DEBUG", False):
@@ -218,32 +255,50 @@ class NotificationDispatcher:
 
         result = merged_result
 
-        if result.success_count == 0:
-            print(f"[翻译] 翻译失败: {result.results[0].error if result.results else '未知错误'}")
-            return report_data, rss_items, rss_new_items, standalone_data
+        if pending:
+            if result.success_count == 0:
+                print(f"[翻译] 翻译失败: {result.results[0].error if result.results else '未知错误'}")
+            else:
+                print(f"[翻译] 翻译完成: {result.success_count}/{result.total_count} 成功")
+        if cache and fresh:
+            try:
+                cache.put_many(language, fresh)
+            except Exception as e:
+                print(f"[翻译] 写入译文缓存失败: {type(e).__name__}: {e}")
 
-        print(f"[翻译] 翻译完成: {result.success_count}/{result.total_count} 成功")
-
-        # 回填翻译结果（仅在翻译文本非空时替换，防止空翻译覆盖原始标题）
-        for i, (loc_type, idx1, idx2) in enumerate(title_locations):
-            if i < len(result.results) and result.results[i].success:
-                translated = result.results[i].translated_text
-                if not translated or not translated.strip():
-                    continue
-                if loc_type == "stats":
-                    report_data["stats"][idx1]["titles"][idx2]["title"] = translated
-                elif loc_type == "new_titles":
-                    report_data["new_titles"][idx1]["titles"][idx2]["title"] = translated
-                elif loc_type == "rss_items" and rss_items:
-                    rss_items[idx1]["titles"][idx2]["title"] = translated
-                elif loc_type == "rss_new_items" and rss_new_items:
-                    rss_new_items[idx1]["titles"][idx2]["title"] = translated
-                elif loc_type == "standalone_platforms" and standalone_data:
-                    standalone_data["platforms"][idx1]["items"][idx2]["title"] = translated
-                elif loc_type == "standalone_rss" and standalone_data:
-                    standalone_data["rss_feeds"][idx1]["items"][idx2]["title"] = translated
+        # 回填翻译结果（仅在译文非空且与原文不同时替换，防止空翻译覆盖原始标题）
+        for text, (loc_type, idx1, idx2) in zip(titles_to_translate, title_locations):
+            translated = known.get(text)
+            if not translated or not translated.strip() or translated == text:
+                continue
+            if loc_type == "stats":
+                report_data["stats"][idx1]["titles"][idx2]["title"] = translated
+            elif loc_type == "new_titles":
+                report_data["new_titles"][idx1]["titles"][idx2]["title"] = translated
+            elif loc_type == "rss_items" and rss_items:
+                rss_items[idx1]["titles"][idx2]["title"] = translated
+            elif loc_type == "rss_new_items" and rss_new_items:
+                rss_new_items[idx1]["titles"][idx2]["title"] = translated
+            elif loc_type == "standalone_platforms" and standalone_data:
+                standalone_data["platforms"][idx1]["items"][idx2]["title"] = translated
+            elif loc_type == "standalone_rss" and standalone_data:
+                standalone_data["rss_feeds"][idx1]["items"][idx2]["title"] = translated
 
         return report_data, rss_items, rss_new_items, standalone_data
+
+    def _translation_cache(self, trans_config: Dict):
+        """cache_days > 0 时返回译文缓存（本地存储 output/meta/translation_cache.db），否则 None"""
+        days = trans_config.get("CACHE_DAYS", 0) or 0
+        if days <= 0:
+            return None
+        from trendradar.ai.translation_cache import TranslationCache, translation_cache_path
+
+        data_dir = self.config.get("STORAGE", {}).get("LOCAL", {}).get("DATA_DIR", "output")
+        try:
+            return TranslationCache(translation_cache_path(data_dir), days, now=self.get_time_func)
+        except Exception as e:
+            print(f"[翻译] 译文缓存不可用，本轮不用缓存: {type(e).__name__}: {e}")
+            return None
 
     def dispatch_all(
         self,

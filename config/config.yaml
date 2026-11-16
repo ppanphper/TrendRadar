@@ -468,6 +468,11 @@ ai_translation:
   batch_size: 100                   # 每批发送给 AI 的标题数，超过此数量自动分批
   batch_interval: 2                 # 分批间隔（秒），避免触发 API 限流，0=不等待
 
+  # 省 token：本轮重复的标题只送一次；以下两项进一步减少送 AI 的条数
+  skip_target_language: false       # 已是目标语言的标题不送 AI（目前只识别中文，如微博热搜）
+  cache_days: 0                     # 译文缓存天数：同一标题只翻译一次，超过 N 天没用到再清理；0=不缓存
+                                    # 缓存在 output/meta/translation_cache.db，改了翻译提示词或模型后可删掉它重新翻译
+
   # 翻译范围（display.regions 关闭的区域即使开启也不会翻译）
   scope:
     hotlist: false                  # 翻译热榜标题（true=翻译, false=不翻译）
