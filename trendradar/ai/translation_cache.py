@@ -17,22 +17,24 @@ from typing import Callable, Dict, Iterable
 _CHINESE_TARGETS = {"中文", "简体中文", "汉语", "chinese", "simplified chinese", "zh", "zh-cn", "zh-hans"}
 
 _HAN_RE = re.compile(r"[㐀-䶿一-鿿]")
-# 假名、谚文：含这些字符说明是日文或韩文，即使夹有汉字也要翻译
-_KANA_HANGUL_RE = re.compile(r"[぀-ヿᄀ-ᇿ가-힯]")
-_LATIN_WORD_RE = re.compile(r"[A-Za-zÀ-ɏ]+")
+# 假名（含半角片假名）、谚文：含这些字符说明是日文或韩文，即使夹有汉字也要翻译
+_KANA_HANGUL_RE = re.compile(r"[぀-ヿｦ-ﾟᄀ-ᇿ가-힯]")
+_LATIN_RE = re.compile(r"[A-Za-zÀ-ɏ]")
 
 
 def already_in_language(text: str, language: str) -> bool:
     """标题已是目标语言时返回 True；无法判断的目标语言一律返回 False（照常翻译）
 
-    中文：含汉字、不含假名和谚文，且汉字数不少于拉丁单词数（允许夹带产品名、缩写）。
+    中文：含汉字、不含假名和谚文，且汉字数不少于拉丁字母数。宁可多送：夹带较多英文的中文标题照常翻译，
+    避免把夹了中文人名的英文标题当成中文。不含假名的日文（如「東京株式市場 大幅続落」）、
+    目标为简体时的繁体标题无法区分，会被当作中文跳过。
     """
     if (language or "").strip().lower() not in _CHINESE_TARGETS:
         return False
     han = len(_HAN_RE.findall(text or ""))
     if not han or _KANA_HANGUL_RE.search(text):
         return False
-    return han >= len(_LATIN_WORD_RE.findall(text))
+    return han >= len(_LATIN_RE.findall(text))
 
 
 def translation_cache_path(data_dir: str) -> Path:

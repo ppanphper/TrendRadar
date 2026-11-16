@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from trendradar.ai.translation_cache import TranslationCache, already_in_language
-from trendradar.ai.translator import BatchTranslationResult, TranslationResult
+from trendradar.ai.translator import AITranslator, BatchTranslationResult, TranslationResult
 from trendradar.notification.dispatcher import NotificationDispatcher
 
 NOW = datetime(2026, 11, 16, 18, 0)
@@ -17,7 +17,6 @@ class AlreadyInLanguageTest(unittest.TestCase):
     def test_chinese_titles(self):
         for text in [
             "华为云发布具身世界模型 基于国产算力昇腾进行训练",
-            "Anthropic 推出 Claude Opus 5.5，支持 1M 上下文",
             "火山引擎宣布即梦2.5超高清API全面开放",
             "如何让agent跑长程任务并且保证质量",
         ]:
@@ -29,6 +28,10 @@ class AlreadyInLanguageTest(unittest.TestCase):
             "Great talk with 张三 today about AI agents",
             "東京で新しいAIモデルが発表された",
             "삼성전자 신형 반도체 공개",
+            "ｶﾀｶﾅ 東京",
+            "Why 小红书 matters",
+            "Remembering 李文亮",
+            "Meet 王小明, CEO",
             "1234 🚀",
         ]:
             self.assertFalse(already_in_language(text, "中文"), text)
@@ -66,6 +69,41 @@ class TranslationCacheTest(unittest.TestCase):
         self.assertEqual(reopened.get_many("中文", ["Old", "Used"]), {"Used": "常用"})
 
 
+def _parse(response, n):
+    return AITranslator._parse_batch_response(AITranslator.__new__(AITranslator), response, n)
+
+
+class BatchAlignmentTest(unittest.TestCase):
+    def test_exact_numbering_is_aligned(self):
+        texts, count, aligned = _parse("[2] 乙\n[1] 甲\n[3] 丙", 3)
+        self.assertEqual((texts, count, aligned), (["甲", "乙", "丙"], 3, True))
+
+    def test_duplicate_or_missing_numbers_not_aligned(self):
+        self.assertFalse(_parse("[1] 甲\n[2] 乙\n[2] 丙", 3)[2])
+        self.assertFalse(_parse("[1] 甲\n[3] 丙", 3)[2])
+        self.assertFalse(_parse("[1] 甲\n[2] 乙\n[3] 丙\n[4] 丁", 3)[2])
+
+    def test_line_fallback_not_aligned(self):
+        texts, count, aligned = _parse("以下是翻译：\n甲\n乙", 3)
+        self.assertEqual(count, 3)
+        self.assertFalse(aligned)
+
+    def test_real_translator_duplicate_numbers_not_cached(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tr = AITranslator.__new__(AITranslator)
+            tr.enabled, tr.target_language = True, "中文"
+            tr.scope = {"HOTLIST": True, "RSS": True, "STANDALONE": True}
+            tr.system_prompt, tr.user_prompt_template = "", "{content}"
+            tr.client = type("C", (), {"api_key": "k"})()
+            config = {"AI_TRANSLATION": {"CACHE_DAYS": 30}, "STORAGE": {"LOCAL": {"DATA_DIR": tmp}}}
+            d = NotificationDispatcher(config, get_time_func=lambda: NOW, split_content_func=None, translator=tr)
+            titles = ["Google releases Gemini", "Meta buys startup", "Apple launches iPhone"]
+            with patch.object(AITranslator, "_call_ai", return_value="[1] 谷歌发布 Gemini\n[2] Meta 收购初创公司\n[2] 苹果发布 iPhone"):
+                d.translate_content({"stats": [], "new_titles": []}, _rss(*titles), None, None, DispatcherTranslationTest.REGIONS)
+            cache = TranslationCache(Path(tmp) / "meta" / "translation_cache.db", 30, now=lambda: NOW)
+            self.assertEqual(cache.get_many("中文", titles), {})
+
+
 class FakeTranslator:
     enabled = True
     target_language = "中文"
@@ -77,7 +115,8 @@ class FakeTranslator:
 
     def translate_batch(self, texts):
         self.calls.append(list(texts))
-        result = BatchTranslationResult(total_count=len(texts), parsed_count=0 if self.fail else len(texts))
+        result = BatchTranslationResult(total_count=len(texts), parsed_count=0 if self.fail else len(texts),
+                                        aligned=not self.fail)
         for text in texts:
             if self.fail:
                 result.results.append(TranslationResult(original_text=text, error="boom"))
@@ -93,7 +132,7 @@ class MisalignedTranslator(FakeTranslator):
 
     def translate_batch(self, texts):
         result = super().translate_batch(texts)
-        result.parsed_count = len(texts) - 1
+        result.aligned = False
         return result
 
 

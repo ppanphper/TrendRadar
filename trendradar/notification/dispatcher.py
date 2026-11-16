@@ -217,13 +217,12 @@ class NotificationDispatcher:
             merged_result.success_count += result.success_count
             merged_result.fail_count += result.fail_count
 
-            # 只缓存编号对齐的批次，且译文与原文不同，避免错位或漏译的结果长期留在缓存里
-            aligned = result.parsed_count == len(batch_texts)
+            # 只缓存编号恰好为 1..N 的批次，且译文与原文不同，避免错位或漏译的结果长期留在缓存里
             for text, res in zip(batch_texts, result.results):
                 translated = res.translated_text if res.success else ""
                 if translated and translated.strip():
                     known[text] = translated
-                    if aligned and translated != text:
+                    if result.aligned and translated != text:
                         fresh[text] = translated
 
             # debug 模式：输出每批的详细信息
