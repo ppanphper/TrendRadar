@@ -9,7 +9,7 @@ Telegram 摘要版式
 import html
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -20,6 +20,7 @@ MIN_FILL = 300
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
+_SENTENCE_END_RE = re.compile(r"[。！？；!?;]")
 
 _MODE_LABELS = {
     "daily": ("📰", "摘要"),
@@ -42,6 +43,25 @@ def to_plain_text(text: str) -> str:
 def normalize_title(title: str) -> str:
     """规范化标题：全角转半角、去空白、小写，用于同一新闻跨平台合并与去重"""
     return _SPACE_RE.sub("", unicodedata.normalize("NFKC", title or "")).lower()
+
+
+def shorten_title(title: str, max_length: int) -> str:
+    """把标题截到 max_length 个字符以内（含末尾省略号）；0 表示不截断
+
+    优先在后半段的最后一个句末标点处断开，其次在空格处（英文原文），否则硬截。
+    """
+    if max_length <= 0 or len(title) <= max_length:
+        return title
+    cut = title[: max_length - 1]
+    floor = max_length // 2
+    ends = [m.end() for m in _SENTENCE_END_RE.finditer(cut)]
+    if ends and ends[-1] >= floor:
+        return cut[: ends[-1]].rstrip("。；;") + "…"
+    if not title[len(cut)].isspace():
+        space = cut.rfind(" ")
+        if space >= floor:
+            cut = cut[:space]
+    return cut.rstrip() + "…"
 
 
 def _esc(text: str) -> str:
@@ -281,12 +301,14 @@ def build_telegram_digest(
     per_group: int = 3,
     max_folded: int = 10,
     limit: int = TELEGRAM_TEXT_LIMIT,
+    title_max_length: int = 0,
 ) -> List[str]:
     """生成 Telegram 摘要消息（HTML），返回按上限切好的消息列表；无内容时返回空列表"""
     return [m.text for m in build_telegram_digest_messages(
         report_data, rss_items, standalone_data, ai_content,
         mode=mode, now=now, headline=headline, alert=alert,
         picks=picks, per_group=per_group, max_folded=max_folded, limit=limit,
+        title_max_length=title_max_length,
     )]
 
 
@@ -304,15 +326,27 @@ def build_telegram_digest_messages(
     per_group: int = 3,
     max_folded: int = 10,
     limit: int = TELEGRAM_TEXT_LIMIT,
+    title_max_length: int = 0,
 ) -> List[DigestMessage]:
-    """同 build_telegram_digest，另外返回每条消息中带编号的条目，供反馈按钮使用"""
+    """同 build_telegram_digest，另外返回每条消息中带编号的条目，供反馈按钮使用
+
+    title_max_length 只影响显示和反馈记录里的标题；合并同一新闻仍按全文比较。
+    """
     now = now or datetime.now()
     groups = collect_groups(report_data, rss_items)
+    if title_max_length > 0:
+        groups = {
+            group: [replace(i, title=shorten_title(i.title, title_max_length)) for i in items]
+            for group, items in groups.items()
+        }
     all_items = [item for items in groups.values() for item in items]
 
     standalone_sections = []
     for section in (standalone_data or {}).get("platforms", []) + (standalone_data or {}).get("rss_feeds", []):
-        items = [i for i in section.get("items", []) if i.get("title")]
+        items = [
+            dict(i, title=shorten_title(i["title"], title_max_length))
+            for i in section.get("items", []) if i.get("title")
+        ]
         if items:
             standalone_sections.append((section.get("name") or section.get("id", ""), items))
     standalone_count = sum(len(items) for _, items in standalone_sections)

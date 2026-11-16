@@ -7,6 +7,7 @@ from datetime import datetime
 from trendradar.notification.telegram_digest import (
     build_telegram_digest,
     build_telegram_digest_messages,
+    shorten_title,
     to_plain_text,
     to_rich_html,
     visible_length,
@@ -161,6 +162,74 @@ class DigestTest(unittest.TestCase):
 
     def test_plain_text_fallback(self):
         self.assertEqual(to_plain_text('<b>a &amp; b</b> <a href="x">c</a>'), "a & b c")
+
+
+class ShortenTitleTest(unittest.TestCase):
+    def test_no_limit_or_short_title_unchanged(self):
+        self.assertEqual(shorten_title("很长" * 50, 0), "很长" * 50)
+        self.assertEqual(shorten_title("短标题", 10), "短标题")
+        self.assertEqual(shorten_title("刚好十个字的一个标题", 10), "刚好十个字的一个标题")
+
+    def test_cuts_at_last_sentence_end(self):
+        title = "物理学家分享了他与模型合作的经历。这是第一篇相关文章，后面还有很多细节内容"
+        self.assertEqual(shorten_title(title, 25), "物理学家分享了他与模型合作的经历…")
+
+    def test_keeps_question_mark(self):
+        title = "这个功能真的有用吗？我试了几天之后发现还有很多问题需要解决"
+        self.assertEqual(shorten_title(title, 20), "这个功能真的有用吗？…")
+
+    def test_hard_cut_without_sentence_end(self):
+        title = "这是一段没有任何句末标点而且非常非常长的推文内容需要被截断"
+        short = shorten_title(title, 12)
+        self.assertEqual(short, title[:11] + "…")
+        self.assertEqual(len(short), 12)
+
+    def test_english_fallback_cuts_at_word_boundary(self):
+        title = "Physicist Nathaniel Craig shares how he worked with the model to develop a definition"
+        self.assertEqual(shorten_title(title, 40), "Physicist Nathaniel Craig shares how he…")
+
+    def test_ignores_sentence_end_too_close_to_start(self):
+        title = "好。这一句很长很长很长很长很长很长很长很长很长很长"
+        self.assertEqual(shorten_title(title, 12), title[:11] + "…")
+
+
+class DigestTitleLengthTest(unittest.TestCase):
+    LONG = "OpenAI：物理学家内森尼尔·克雷格分享了他如何与模型合作。这是该系列的第一篇文章，后面还有更多" + "细节" * 30
+
+    def test_rss_titles_shortened_in_text_and_registry(self):
+        rss = [{"word": "AI", "count": 1, "titles": [_title(self.LONG, source="X - AI", url="https://x.com/a/1")]}]
+        msg = build_telegram_digest_messages({"stats": []}, rss, now=NOW, title_max_length=40)[0]
+        self.assertIn("OpenAI：物理学家内森尼尔·克雷格分享了他如何与模型合作…</a>", msg.text)
+        self.assertNotIn("细节细节", msg.text)
+        self.assertEqual(msg.items[0]["title"], "OpenAI：物理学家内森尼尔·克雷格分享了他如何与模型合作…")
+        self.assertEqual(msg.items[0]["url"], "https://x.com/a/1")
+
+    def test_standalone_titles_shortened(self):
+        standalone = {"platforms": [], "rss_feeds": [
+            {"id": "x-ai", "name": "X - AI", "items": [{"title": self.LONG, "url": "https://x.com/a/2"}]},
+        ]}
+        msg = build_telegram_digest_messages({"stats": []}, None, standalone, now=NOW, title_max_length=40)[0]
+        self.assertIn("模型合作…</a>", msg.text)
+        self.assertNotIn("细节细节", msg.text)
+        self.assertEqual(msg.items[0]["title"], "OpenAI：物理学家内森尼尔·克雷格分享了他如何与模型合作…")
+        # 不改动传入的数据（网页报告等其他用途仍用全文）
+        self.assertEqual(standalone["rss_feeds"][0]["items"][0]["title"], self.LONG)
+
+    def test_merge_uses_full_titles(self):
+        a = _title("同样的开头" * 6 + "后面讲的是甲", url="https://x.com/a/3")
+        b = _title("同样的开头" * 6 + "后面讲的是乙", url="https://x.com/a/4")
+        msg = build_telegram_digest_messages(_report([("AI", [a, b])]), now=NOW, title_max_length=10)[0]
+        self.assertEqual(len(msg.items), 2)
+
+    def test_escapes_after_shortening(self):
+        title = "A&B 发布新模型，" + "性能大幅提升" * 10
+        text = build_telegram_digest(_report([("AI", [_title(title)])]), now=NOW, title_max_length=20)[0]
+        self.assertIn("A&amp;B 发布新模型", text)
+        self.assertNotIn("性能大幅提升性能大幅提升性能大幅提升", text)
+
+    def test_default_keeps_full_title(self):
+        text = build_telegram_digest(_report([("AI", [_title(self.LONG)])]), now=NOW)[0]
+        self.assertIn(self.LONG, text)
 
 
 if __name__ == "__main__":

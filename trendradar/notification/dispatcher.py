@@ -618,6 +618,7 @@ class NotificationDispatcher:
                     alert=alert,
                     get_time_func=self.get_time_func,
                     feedback_db=self._feedback_db_path(),
+                    title_max_length=self.config.get("TELEGRAM_TITLE_MAX_LENGTH", 0),
                 )
                 results.append(result)
 

@@ -436,6 +436,7 @@ def _load_webhook_config(config_data: Dict) -> Dict:
         "TELEGRAM_CHAT_ID": _get_env_str("TELEGRAM_CHAT_ID") or telegram.get("chat_id", ""),
         "TELEGRAM_MESSAGE_THREAD_ID": _get_env_str("TELEGRAM_MESSAGE_THREAD_ID") or str(telegram.get("message_thread_id", "") or ""),
         "TELEGRAM_STYLE": _get_env_str("TELEGRAM_STYLE") or telegram.get("style", "classic"),
+        "TELEGRAM_TITLE_MAX_LENGTH": _get_env_int_or_none("TELEGRAM_TITLE_MAX_LENGTH") if _get_env_int_or_none("TELEGRAM_TITLE_MAX_LENGTH") is not None else int(telegram.get("title_max_length", 0) or 0),
         "TELEGRAM_FEEDBACK": _get_env_bool("TELEGRAM_FEEDBACK") if _get_env_bool("TELEGRAM_FEEDBACK") is not None else bool(telegram.get("feedback", False)),
         "TELEGRAM_FEEDBACK_USER_IDS": _get_env_str("TELEGRAM_FEEDBACK_USER_IDS") or str(telegram.get("feedback_user_ids", "") or ""),
         # 邮件
