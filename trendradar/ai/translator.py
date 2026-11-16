@@ -198,6 +198,7 @@ class AITranslator:
                 else:
                     batch_result.results[idx].translated_text = batch_result.results[idx].original_text
                     batch_result.results[idx].success = True
+                    batch_result.results[idx].error = "AI 返回空译文，保留原文"
                     batch_result.success_count += 1
 
         except Exception as e:

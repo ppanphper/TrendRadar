@@ -104,6 +104,28 @@ class BatchAlignmentTest(unittest.TestCase):
             self.assertEqual(cache.get_many("中文", titles), {})
 
 
+    def _real_translator(self):
+        tr = AITranslator.__new__(AITranslator)
+        tr.enabled, tr.target_language = True, "中文"
+        tr.scope = {"HOTLIST": True, "RSS": True, "STANDALONE": True}
+        tr.system_prompt, tr.user_prompt_template = "", "{content}"
+        tr.client = type("C", (), {"api_key": "k"})()
+        return tr
+
+    def test_unchanged_cached_but_empty_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"AI_TRANSLATION": {"CACHE_DAYS": 30}, "STORAGE": {"LOCAL": {"DATA_DIR": tmp}}}
+            d = NotificationDispatcher(config, get_time_func=lambda: NOW, split_content_func=None,
+                                       translator=self._real_translator())
+            titles = ["Knight回应Bin是否留队", "Hello world"]
+            with patch.object(AITranslator, "_call_ai", return_value="[1] Knight回应Bin是否留队\n[2] "):
+                _, rss, _, _ = d.translate_content({"stats": [], "new_titles": []}, _rss(*titles), None, None,
+                                                   DispatcherTranslationTest.REGIONS)
+            self.assertEqual([t["title"] for t in rss[0]["titles"]], titles)
+            cache = TranslationCache(Path(tmp) / "meta" / "translation_cache.db", 30, now=lambda: NOW)
+            self.assertEqual(cache.get_many("中文", titles), {"Knight回应Bin是否留队": "Knight回应Bin是否留队"})
+
+
 class FakeTranslator:
     enabled = True
     target_language = "中文"
