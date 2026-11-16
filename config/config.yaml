@@ -295,6 +295,7 @@ notification:
       chat_id: ""                     # Telegram Chat ID
       message_thread_id: ""           # 群组话题 ID（可选，发到指定话题）
       style: "classic"                # 版式：classic=原版式，digest=摘要版式（精选 + 分组折叠，消息更少）
+      title_max_length: 0             # 摘要版式下标题最多显示多少字（翻译后截断，含省略号）；0=不截断
       feedback: false                 # 摘要下方显示 👍/👎 按钮（需运行 python -m trendradar.bot，且使用独立 bot）
       feedback_user_ids: ""           # 允许反馈的 Telegram 用户 ID，多个用 ; 分隔；留空=群内所有人
 

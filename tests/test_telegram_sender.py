@@ -50,6 +50,19 @@ class SenderTest(unittest.TestCase):
         self.assertEqual([(i["n"], i["title"]) for i in store.message_items("-100", 42)], [(1, "A<B")])
         self.assertIn("<code>1</code> ", store.message_text("-100", 42))
 
+    def test_digest_passes_title_max_length(self):
+        long_report = {"stats": [{"word": "AI", "count": 1, "titles": [
+            {"title": "很长的标题" * 20, "source_name": "X", "ranks": [1], "url": "https://a", "relevance_score": 0.9},
+        ]}]}
+        with patch("trendradar.notification.senders.requests.post", return_value=_ok(5)) as post:
+            self.assertTrue(send_to_telegram(
+                "token", "-100", long_report, "增量分析", mode="incremental", style="digest",
+                get_time_func=lambda: datetime(2026, 11, 12, 10, 0), batch_interval=0, title_max_length=20,
+            ))
+        text = post.call_args.kwargs["json"]["text"]
+        self.assertIn("很长的标题" * 3 + "很长的标…", text)
+        self.assertNotIn("很长的标题" * 5, text)
+
     def test_rich_failure_falls_back_to_plain_message_with_grid(self):
         bad = MagicMock(status_code=400, text='{"ok":false,"description":"Bad Request: rich"}')
         bad.json.return_value = {"ok": False, "description": "Bad Request: rich"}
@@ -77,6 +90,28 @@ class SenderTest(unittest.TestCase):
         self.assertNotIn("parse_mode", retry)
         self.assertIn("A<B", retry["text"])
         self.assertEqual(len(FeedbackStore(self.db).message_items("-100", 5)), 1)
+
+
+class TitleMaxLengthConfigTest(unittest.TestCase):
+    def _config(self, telegram):
+        from trendradar.core.loader import _load_webhook_config
+        return _load_webhook_config({"notification": {"channels": {"telegram": telegram}}})
+
+    def test_loads_from_config_and_env(self):
+        self.assertEqual(self._config({})["TELEGRAM_TITLE_MAX_LENGTH"], 0)
+        self.assertEqual(self._config({"title_max_length": 80})["TELEGRAM_TITLE_MAX_LENGTH"], 80)
+        with patch.dict("os.environ", {"TELEGRAM_TITLE_MAX_LENGTH": "60"}):
+            self.assertEqual(self._config({"title_max_length": 80})["TELEGRAM_TITLE_MAX_LENGTH"], 60)
+
+    def test_dispatcher_passes_title_max_length(self):
+        from trendradar.notification.dispatcher import NotificationDispatcher
+        config = {"TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_CHAT_ID": "-100", "TELEGRAM_STYLE": "digest",
+                  "TELEGRAM_TITLE_MAX_LENGTH": 80}
+        dispatcher = NotificationDispatcher(config, get_time_func=lambda: datetime(2026, 11, 12, 10, 0),
+                                            split_content_func=MagicMock())
+        with patch("trendradar.notification.dispatcher.send_to_telegram", return_value=True) as send:
+            self.assertTrue(dispatcher._send_telegram(REPORT, "增量分析", None, None, "incremental"))
+        self.assertEqual(send.call_args.kwargs["title_max_length"], 80)
 
 
 if __name__ == "__main__":

@@ -530,6 +530,7 @@ def send_to_telegram(
     alert: bool = False,
     get_time_func: Optional[Callable] = None,
     feedback_db: Optional[str] = None,
+    title_max_length: int = 0,
 ) -> bool:
     """
     发送到 Telegram（支持分批发送，支持热榜+RSS合并+独立展示区）
@@ -554,6 +555,7 @@ def send_to_telegram(
         headline: 摘要版式的标题（如调度时段名）
         alert: 摘要版式下按即时提醒排版
         feedback_db: 反馈库路径；摘要版式下设置后附带感兴趣 / 不感兴趣按钮并记录消息与条目的映射
+        title_max_length: 摘要版式下标题的最大字符数，超出部分截断；0 表示不截断
 
     Returns:
         bool: 发送是否成功
@@ -582,6 +584,7 @@ def send_to_telegram(
             now=get_time_func() if get_time_func else None,
             headline=headline,
             alert=alert,
+            title_max_length=title_max_length,
         )
         batches = [m.text for m in digest]
         batch_items = [m.items for m in digest]
